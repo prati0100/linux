@@ -239,6 +239,10 @@ static const struct flash_info atmel_nor_parts[] = {
 		.no_sfdp_flags = SECT_4K,
 		.fixups = &at25fs_nor_fixups
 	}, {
+		/*
+		 * at25sf321, at25s321b -- both share the same ID though the
+		 * former does not support SFDP.
+		 */
 		.id = SNOR_ID(0x1f, 0x87, 0x01),
 		.size = SZ_4M,
 		.no_sfdp_flags = SECT_4K | SPI_NOR_DUAL_READ | SPI_NOR_QUAD_READ,
