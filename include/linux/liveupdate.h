@@ -10,9 +10,98 @@
 #include <linux/bug.h>
 #include <linux/types.h>
 #include <linux/list.h>
+#include <linux/mutex.h>
 #include <uapi/linux/liveupdate.h>
 
 struct liveupdate_subsystem;
+struct liveupdate_file_handler;
+struct liveupdate_session;
+struct file;
+
+/**
+ * struct liveupdate_file_op_args - Arguments for file operation callbacks.
+ *
+ * This structure bundles all parameters for the file operation callbacks.
+ * The 'data' and 'file' fields are used for both input and output.
+ *
+ * @handler:   The file handler being called.
+ * @session:   The session this file belongs to.
+ * @reclaimed: The reclaimed status for the 'finish' operation.
+ * @data:      The opaque u64 handle.
+ *             - preserve/prepare/freeze may update this field.
+ * @file:      The file object.
+ *             - For retrieve: [OUT] The callback sets this to the new file.
+ *             - For other ops: [IN] The caller sets this to the file being
+ *               operated on.
+ */
+struct liveupdate_file_op_args {
+	struct liveupdate_file_handler *handler;
+	struct liveupdate_session *session;
+	bool reclaimed;
+	u64 data;
+	struct file *file;
+};
+
+/**
+ * struct liveupdate_file_ops - Callbacks for live-updatable files.
+ *
+ * All operations (except can_preserve) receive a pointer to a
+ * 'struct liveupdate_file_op_args' containing the necessary context.
+ *
+ * @can_preserve:         Required. Lightweight check to see if this handler is
+ *                        compatible with the given file.
+ * @preserve:             Required. Performs heavy state-saving for the file.
+ * @unpreserve:           Optional. Cleans up any resources allocated by
+ *                        @preserve.
+ * @prepare:              Optional. Lightweight final checks during the global
+ *                        PREPARE.
+ * @freeze:               Optional. Final actions just before kernel transition.
+ * @cancel:               Optional. Cleans up after a global abort.
+ * @finish:               Optional. Final cleanup in the new kernel.
+ * @retrieve:             Required. Restores the file in the new kernel.
+ * @owner:                Module reference
+ */
+struct liveupdate_file_ops {
+	bool (*can_preserve)(struct liveupdate_file_handler *handler,
+			     struct file *file);
+	int (*preserve)(struct liveupdate_file_op_args *args);
+	void (*unpreserve)(struct liveupdate_file_op_args *args);
+	int (*prepare)(struct liveupdate_file_op_args *args);
+	int (*freeze)(struct liveupdate_file_op_args *args);
+	void (*cancel)(struct liveupdate_file_op_args *args);
+	void (*finish)(struct liveupdate_file_op_args *args);
+	int (*retrieve)(struct liveupdate_file_op_args *args);
+	struct module *owner;
+};
+
+/* The max size is set so it can be reliably used during in serialization */
+#define LIVEUPDATE_HNDL_COMPAT_LENGTH	48
+
+/**
+ * struct liveupdate_file_handler - Represents a handler for a live-updatable
+ * file type.
+ * @ops:                Callback functions
+ * @compatible:         The compatibility string (e.g., "memfd-v1", "vfiofd-v1")
+ *                      that uniquely identifies the file type this handler
+ *                      supports. This is matched against the compatible string
+ *                      associated with individual &struct liveupdate_file
+ *                      instances.
+ * @list:               Used for linking this handler instance into a global
+ *                      list of registered file handlers.
+ * @count:              Atomic counter of number of files that are preserved and
+ *                      use this handler.
+ *
+ * Modules that want to support live update for specific file types should
+ * register an instance of this structure. LUO uses this registration to
+ * determine if a given file can be preserved and to find the appropriate
+ * operations to manage its state across the update.
+ */
+struct liveupdate_file_handler {
+	const struct liveupdate_file_ops *ops;
+	const char compatible[LIVEUPDATE_HNDL_COMPAT_LENGTH];
+	struct list_head list;
+	atomic_t count;
+};
 
 /**
  * struct liveupdate_subsystem_ops - LUO events callback functions
@@ -83,6 +172,12 @@ int liveupdate_register_subsystem(struct liveupdate_subsystem *h);
 int liveupdate_unregister_subsystem(struct liveupdate_subsystem *h);
 int liveupdate_get_subsystem_data(struct liveupdate_subsystem *h, u64 *data);
 
+int liveupdate_register_file_handler(struct liveupdate_file_handler *h);
+int liveupdate_unregister_file_handler(struct liveupdate_file_handler *h);
+
+int liveupdate_find_file(struct liveupdate_session *sn, u64 token,
+			 struct file **filep);
+
 #else /* CONFIG_LIVEUPDATE */
 
 static inline int liveupdate_reboot(void)
@@ -124,6 +219,22 @@ static inline int liveupdate_get_subsystem_data(struct liveupdate_subsystem *h,
 						u64 *data)
 {
 	return -ENODATA;
+}
+
+static inline int liveupdate_register_file_handler(struct liveupdate_file_handler *h)
+{
+	return 0;
+}
+
+static inline int liveupdate_unregister_file_handler(struct liveupdate_file_handler *h)
+{
+	return 0;
+}
+
+static inline int liveupdate_find_file(struct liveupdate_session *sn, u64 token,
+				       struct file **filep)
+{
+	return -ENOENT;
 }
 
 #endif /* CONFIG_LIVEUPDATE */
