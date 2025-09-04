@@ -909,6 +909,8 @@ ifdef CONFIG_CC_IS_GCC
 KBUILD_CFLAGS	+= $(call cc-option,--param=allow-store-data-races=0)
 KBUILD_CFLAGS	+= $(call cc-option,-fno-allow-store-data-races)
 endif
+# No sframe generation for kernel if enabled by default
+KBUILD_CFLAGS	+= $(call cc-option,-Xassembler --gsframe=no)
 
 ifdef CONFIG_READABLE_ASM
 # Disable optimizations that make assembler listings hard to read.
