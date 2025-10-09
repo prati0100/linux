@@ -123,6 +123,19 @@ struct liveupdate_file_handler {
 };
 
 /**
+ * struct liveupdate_fd - Describes a preserved file descriptor.
+ * @session_name: The name of the session this FD belongs to.
+ * @token:        The user-provided token for this FD.
+ * @data:         The private u64 data payload saved by the handler's
+ *                .preserve() callback.
+ */
+struct liveupdate_fd {
+	const char *session_name;
+	u64 token;
+	u64 data;
+};
+
+/**
  * struct liveupdate_subsystem_ops - LUO events callback functions
  * @prepare:      Optional. Called during LUO prepare phase. Should perform
  *                preparatory actions and can store a u64 handle/state
@@ -200,6 +213,9 @@ int liveupdate_find_file(struct liveupdate_session *sn, u64 token,
 void *liveupdate_fh_global_state_get(struct liveupdate_file_handler *h);
 void liveupdate_fh_global_state_put(struct liveupdate_file_handler *h);
 
+int liveupdate_fd_data_query(struct liveupdate_file_handler *h,
+                             struct liveupdate_fd *fds, long count);
+
 #else /* CONFIG_LIVEUPDATE */
 
 static inline int liveupdate_reboot(void)
@@ -266,6 +282,12 @@ static inline void *liveupdate_fh_global_state_get(struct liveupdate_file_handle
 
 static inline void liveupdate_fh_global_state_put(struct liveupdate_file_handler *h)
 {
+}
+
+static inline int liveupdate_fd_data_query(struct liveupdate_file_handler *h,
+					   struct liveupdate_fd *fds, long count)
+{
+	return -EOPNOTSUPP;
 }
 
 #endif /* CONFIG_LIVEUPDATE */

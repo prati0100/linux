@@ -107,5 +107,8 @@ int luo_file_freeze(struct luo_session *session);
 void luo_file_finish(struct luo_session *session);
 void luo_file_cancel(struct luo_session *session);
 void luo_file_deserialize(struct luo_session *session);
+long luo_file_query(struct luo_session *session,
+		    struct liveupdate_file_handler *h,
+		    struct liveupdate_fd *fds);
 
 #endif /* _LINUX_LUO_INTERNAL_H */

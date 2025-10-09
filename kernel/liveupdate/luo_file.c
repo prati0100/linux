@@ -644,6 +644,25 @@ void luo_file_unpreserve_unreclaimed_files(struct luo_session *session)
 	}
 }
 
+long luo_file_query(struct luo_session *session,
+		    struct liveupdate_file_handler *h,
+		    struct liveupdate_fd *fds)
+{
+	struct luo_file *luo_file;
+	long found = 0;
+
+	list_for_each_entry(luo_file, &session->files_list, list) {
+		if (luo_file->fh == h) {
+			fds[found].session_name = session->name;
+			fds[found].token = luo_file->token;
+			fds[found].data = luo_file->private_data;
+			found++;
+		}
+	}
+
+	return found;
+}
+
 /**
  * liveupdate_register_file_handler - Register a file handler with LUO.
  * @fh: Pointer to a caller-allocated &struct liveupdate_file_handler.

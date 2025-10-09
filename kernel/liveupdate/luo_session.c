@@ -885,3 +885,61 @@ static int __init luo_session_startup(void)
 	return ret;
 }
 late_initcall(luo_session_startup);
+
+/**
+ * liveupdate_fd_data_query() - Query private data for preserved FDs of a
+ * specific type.
+ * @h:      The file handler to search for. Only FDs managed by this handler
+ *          will be returned.
+ * @fds:    A caller-provided array to be filled with query results.
+ * @count:  Input parameter specifying the capacity of the @fds array. The
+ *          caller is responsible for allocating an array of the correct size,
+ *          which can be determined by reading atomic_read(&h->count).
+ *
+ * This function allows a kernel subsystem to inspect the preserved state of
+ * all file descriptors associated with a specific handler. It is intended to be
+ * called early during boot in the new kernel, when the system is in the
+ * LIVEUPDATE_STATE_UPDATED state, before userspace has retrieved the FDs.
+ *
+ * It validates that the provided buffer size matches the number of preserved
+ * FDs for the handler before proceeding.
+ *
+ * Return: 0 on success.
+ * -EINVAL if any arguments are invalid or if the provided @count does not
+ *          match the actual number of preserved FDs.
+ * -EAGAIN if the system is not in the UPDATED state.
+ */
+int liveupdate_fd_data_query(struct liveupdate_file_handler *h,
+			     struct liveupdate_fd *fds, long count)
+{
+	struct luo_session *session;
+	long found = 0;
+
+	if (!h || !fds || count < 0)
+		return -EINVAL;
+
+	if (!liveupdate_state_updated())
+		return -EAGAIN;
+
+	/*
+	 * The caller must provide a buffer of the exact correct size.
+	 * If counts mismatch, the caller's view is stale or incorrect.
+	 */
+	if (count != atomic_read(&h->count))
+		return -EINVAL;
+
+	if (!count)
+		return 0;
+
+	luo_session_deserialize();
+
+	guard(rwsem_read)(&luo_session_global.rwsem);
+	list_for_each_entry(session, &luo_session_global.list, list) {
+		scoped_guard(mutex, &session->mutex)
+			found += luo_file_query(session, h, fds + found);
+	}
+	WARN_ON_ONCE(found != count);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(liveupdate_fd_data_query);
