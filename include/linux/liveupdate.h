@@ -59,6 +59,10 @@ struct liveupdate_file_op_args {
  * @cancel:               Optional. Cleans up after a global abort.
  * @finish:               Optional. Final cleanup in the new kernel.
  * @retrieve:             Required. Restores the file in the new kernel.
+ * @global_state_create:  Optional. Creates a handler-scoped global state
+ *                        object.
+ * @global_state_restore: Optional. Restores the global state object.
+ * @global_state_destroy: Optional. Destroys the global state object.
  * @owner:                Module reference
  */
 struct liveupdate_file_ops {
@@ -71,6 +75,12 @@ struct liveupdate_file_ops {
 	void (*cancel)(struct liveupdate_file_op_args *args);
 	void (*finish)(struct liveupdate_file_op_args *args);
 	int (*retrieve)(struct liveupdate_file_op_args *args);
+	int (*global_state_create)(struct liveupdate_file_handler *h,
+				   void **obj, u64 *data_handle);
+	int (*global_state_restore)(struct liveupdate_file_handler *h,
+				    u64 data, void **obj);
+	void (*global_state_destroy)(struct liveupdate_file_handler *h,
+				     void *obj);
 	struct module *owner;
 };
 
@@ -90,6 +100,12 @@ struct liveupdate_file_ops {
  *                      list of registered file handlers.
  * @count:              Atomic counter of number of files that are preserved and
  *                      use this handler.
+ * global_state_lock:   Protects access to global state data.
+ * global_state_obj:    Global state object that can be accessed by various
+ *                      subsystems that need to keep state bound to the life
+ *                      cycle of FDs of a specific type.
+ * global_stage_handle: Used to pass global state from current kernel to next
+ *                      kernel.
  *
  * Modules that want to support live update for specific file types should
  * register an instance of this structure. LUO uses this registration to
@@ -101,6 +117,9 @@ struct liveupdate_file_handler {
 	const char compatible[LIVEUPDATE_HNDL_COMPAT_LENGTH];
 	struct list_head list;
 	atomic_t count;
+	struct mutex global_state_lock;
+	void *global_state_obj;
+	u64 global_state_handle;
 };
 
 /**
@@ -178,6 +197,9 @@ int liveupdate_unregister_file_handler(struct liveupdate_file_handler *h);
 int liveupdate_find_file(struct liveupdate_session *sn, u64 token,
 			 struct file **filep);
 
+void *liveupdate_fh_global_state_get(struct liveupdate_file_handler *h);
+void liveupdate_fh_global_state_put(struct liveupdate_file_handler *h);
+
 #else /* CONFIG_LIVEUPDATE */
 
 static inline int liveupdate_reboot(void)
@@ -235,6 +257,15 @@ static inline int liveupdate_find_file(struct liveupdate_session *sn, u64 token,
 				       struct file **filep)
 {
 	return -ENOENT;
+}
+
+static inline void *liveupdate_fh_global_state_get(struct liveupdate_file_handler *h)
+{
+	return ERR_PTR(-EOPNOTSUPP);
+}
+
+static inline void liveupdate_fh_global_state_put(struct liveupdate_file_handler *h)
+{
 }
 
 #endif /* CONFIG_LIVEUPDATE */

@@ -64,6 +64,27 @@
 #include <linux/string.h>
 #include "luo_internal.h"
 
+/*
+ * Serialization for handler-scoped global state.
+ */
+#define LUO_FH_STATE_COMPATIBLE "luo-fh-states-v1-struct"
+
+struct luo_fh_state_ser_entry {
+	char compatible[LIVEUPDATE_HNDL_COMPAT_LENGTH];
+	u64 data;
+} __packed;
+
+struct luo_fh_state_ser_header {
+	u64 count;
+	u64 entries_pa;
+} __packed;
+
+static struct luo_fh_state_ser_header *luo_fh_header_in;
+static struct luo_fh_state_ser_entry *luo_fh_entries_in;
+
+/* Forward declaration */
+static void __luo_fh_global_state_destroy(struct liveupdate_file_handler *fh);
+
 /* Registered files. */
 static DECLARE_RWSEM(luo_file_handler_list_rwsem);
 static LIST_HEAD(luo_file_handler_list);
@@ -516,8 +537,10 @@ int luo_unpreserve_file(struct luo_session *session, u64 token)
 		fput(last_file->file);
 
 	mutex_destroy(&last_file->mutex);
-	scoped_guard(rwsem_read, &luo_file_handler_list_rwsem)
-		atomic_dec(&last_file->fh->count);
+	scoped_guard(rwsem_read, &luo_file_handler_list_rwsem) {
+		if (atomic_dec_and_test(&last_file->fh->count))
+			__luo_fh_global_state_destroy(last_file->fh);
+	}
 	kfree(last_file);
 
 	return 0;
@@ -612,8 +635,10 @@ void luo_file_unpreserve_unreclaimed_files(struct luo_session *session)
 				fput(h->file);
 
 			mutex_destroy(&h->mutex);
-			scoped_guard(rwsem_read, &luo_file_handler_list_rwsem)
-				atomic_dec(&h->fh->count);
+			scoped_guard(rwsem_read, &luo_file_handler_list_rwsem) {
+				if (atomic_dec_and_test(&h->fh->count))
+					__luo_fh_global_state_destroy(h->fh);
+			}
 			kfree(h);
 		}
 	}
@@ -651,9 +676,23 @@ int liveupdate_register_file_handler(struct liveupdate_file_handler *fh)
 	if (!try_module_get(fh->ops->owner))
 		return -EAGAIN;
 
+	mutex_init(&fh->global_state_lock);
+	fh->global_state_obj = NULL;
+	fh->global_state_handle = 0;
 	INIT_LIST_HEAD(&fh->list);
 	atomic_set(&fh->count, 0);
 	list_add_tail(&fh->list, &luo_file_handler_list);
+
+	if (liveupdate_state_updated() && luo_fh_entries_in) {
+		int i;
+
+		for (i = 0; i < luo_fh_header_in->count; i++) {
+			if (!strcmp(luo_fh_entries_in[i].compatible, fh->compatible)) {
+				fh->global_state_handle = luo_fh_entries_in[i].data;
+				break;
+			}
+		}
+	}
 
 	return 0;
 }
@@ -719,3 +758,141 @@ int liveupdate_find_file(struct liveupdate_session *sn, u64 token,
 
 	return -ENOENT;
 }
+
+void *liveupdate_fh_global_state_get(struct liveupdate_file_handler *h)
+{
+	int ret = 0;
+
+	mutex_lock(&h->global_state_lock);
+
+	if (h->global_state_obj)
+		return h->global_state_obj;
+
+	if (liveupdate_state_updated()) {
+		if (!h->ops->global_state_restore) {
+			ret = -EOPNOTSUPP;
+			goto err_unlock;
+		}
+		ret = h->ops->global_state_restore(h, h->global_state_handle,
+						   &h->global_state_obj);
+	} else {
+		if (!h->ops->global_state_create) {
+			ret = -EOPNOTSUPP;
+			goto err_unlock;
+		}
+		ret = h->ops->global_state_create(h, &h->global_state_obj,
+						  &h->global_state_handle);
+	}
+
+	if (ret || !h->global_state_obj) {
+		h->global_state_obj = NULL;
+		h->global_state_handle = 0;
+		if (!ret)
+			ret = -ENODATA;
+		goto err_unlock;
+	}
+
+	return h->global_state_obj;
+
+err_unlock:
+	mutex_unlock(&h->global_state_lock);
+	return ERR_PTR(ret);
+}
+EXPORT_SYMBOL_GPL(liveupdate_fh_global_state_get);
+
+void liveupdate_fh_global_state_put(struct liveupdate_file_handler *h)
+{
+	mutex_unlock(&h->global_state_lock);
+}
+EXPORT_SYMBOL_GPL(liveupdate_fh_global_state_put);
+
+static void __luo_fh_global_state_destroy(struct liveupdate_file_handler *fh)
+{
+	mutex_lock(&fh->global_state_lock);
+	if (fh->global_state_obj) {
+		if (fh->ops->global_state_destroy)
+			fh->ops->global_state_destroy(fh, fh->global_state_obj);
+		fh->global_state_obj = NULL;
+		fh->global_state_handle = 0;
+	}
+	mutex_unlock(&fh->global_state_lock);
+}
+
+static int luo_fh_global_state_prepare(struct liveupdate_subsystem *h,
+				       u64 *data)
+{
+	struct liveupdate_file_handler *fh;
+	struct luo_fh_state_ser_header *header;
+	struct luo_fh_state_ser_entry *entries;
+	size_t entries_size;
+	u64 count = 0;
+	int i = 0;
+
+	down_read(&luo_file_handler_list_rwsem);
+	list_for_each_entry(fh, &luo_file_handler_list, list) {
+		if (atomic_read(&fh->count) > 0 && fh->global_state_handle)
+			count++;
+	}
+	up_read(&luo_file_handler_list_rwsem);
+
+	if (count == 0) {
+		*data = 0;
+		return 0;
+	}
+
+	entries_size = count * sizeof(*entries);
+	entries = luo_contig_alloc_preserve(entries_size);
+	if (IS_ERR(entries))
+		return PTR_ERR(entries);
+
+	header = luo_contig_alloc_preserve(sizeof(*header));
+	if (IS_ERR(header)) {
+		luo_contig_free_unpreserve(entries, entries_size);
+		return PTR_ERR(header);
+	}
+
+	down_read(&luo_file_handler_list_rwsem);
+	list_for_each_entry(fh, &luo_file_handler_list, list) {
+		if (atomic_read(&fh->count) > 0 && fh->global_state_handle) {
+			strscpy(entries[i].compatible, fh->compatible, sizeof(entries[i].compatible));
+			entries[i].data = fh->global_state_handle;
+			i++;
+		}
+	}
+	up_read(&luo_file_handler_list_rwsem);
+
+	header->count = count;
+	header->entries_pa = __pa(entries);
+	*data = __pa(header);
+
+	return 0;
+}
+
+static void luo_fh_global_state_boot(struct liveupdate_subsystem *h, u64 data)
+{
+	if (!data)
+		return;
+
+	luo_fh_header_in = __va(data);
+	luo_fh_entries_in = __va(luo_fh_header_in->entries_pa);
+}
+
+static const struct liveupdate_subsystem_ops luo_fh_state_subsys_ops = {
+	.prepare = luo_fh_global_state_prepare,
+	.boot = luo_fh_global_state_boot,
+	.owner = THIS_MODULE,
+};
+
+static struct liveupdate_subsystem luo_fh_state_subsys = {
+	.ops = &luo_fh_state_subsys_ops,
+	.name = LUO_FH_STATE_COMPATIBLE,
+};
+
+static int __init luo_file_init(void)
+{
+	if (!liveupdate_enabled())
+		return 0;
+
+	return liveupdate_register_subsystem(&luo_fh_state_subsys);
+}
+late_initcall(luo_file_init);
