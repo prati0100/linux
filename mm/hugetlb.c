@@ -3309,7 +3309,11 @@ static void __init prep_and_add_bootmem_folios(struct hstate *h,
 					pages_per_huge_page(h));
 		}
 		hugetlb_bootmem_init_migratetype(folio, h);
-		/* Subdivide locks to achieve better parallel performance */
+		/*
+		 * The folios are initialized in parallel. Drop the lock after
+		 * enqueuing so other tasks can make progress while the next one
+		 * is being initialized.
+		 */
 		spin_lock_irqsave(&hugetlb_lock, flags);
 		account_new_hugetlb_folio(h, folio);
 		enqueue_hugetlb_folio(h, folio);
