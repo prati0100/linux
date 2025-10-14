@@ -1517,6 +1517,7 @@ struct file *hugetlb_file_setup(const char *name, size_t size,
 	struct vfsmount *mnt;
 	int hstate_idx;
 	struct file *file;
+	long reserved;
 
 	hstate_idx = get_hstate_idx(page_size_log);
 	if (hstate_idx < 0)
@@ -1537,30 +1538,35 @@ struct file *hugetlb_file_setup(const char *name, size_t size,
 		return ERR_PTR(-EPERM);
 	}
 
-	file = ERR_PTR(-ENOSPC);
 	/* hugetlbfs_vfsmount[] mounts do not use idmapped mounts.  */
 	inode = hugetlbfs_get_inode(mnt->mnt_sb, &nop_mnt_idmap, NULL,
 				    S_IFREG | S_IRWXUGO, 0);
 	if (!inode)
-		goto out;
+		return ERR_PTR(-ENOSPC);
+
 	if (creat_flags == HUGETLB_SHMFS_INODE)
 		inode->i_flags |= S_PRIVATE;
 
 	inode->i_size = size;
 	clear_nlink(inode);
 
-	if (hugetlb_reserve_pages(inode, 0,
-			size >> huge_page_shift(hstate_inode(inode)), NULL,
-			acctflag) < 0)
+	reserved = hugetlb_reserve_pages(inode, 0,
+					 size >> huge_page_shift(hstate_inode(inode)),
+					 NULL, acctflag);
+	if (reserved < 0) {
 		file = ERR_PTR(-ENOMEM);
-	else
-		file = alloc_file_pseudo(inode, mnt, name, O_RDWR,
-					&hugetlbfs_file_operations);
-	if (!IS_ERR(file))
-		return file;
+		goto out;
+	}
 
-	iput(inode);
+	file = alloc_file_pseudo(inode, mnt, name, O_RDWR,
+				 &hugetlbfs_file_operations);
+	if (IS_ERR(file))
+		goto out;
+
+	return file;
+
 out:
+	iput(inode);
 	return file;
 }
 
