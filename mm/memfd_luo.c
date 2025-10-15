@@ -19,6 +19,7 @@
 #include <linux/kexec_handover.h>
 #include <linux/shmem_fs.h>
 #include <linux/bits.h>
+#include <linux/vmalloc.h>
 #include "internal.h"
 
 #define PRESERVED_PFN_MASK		GENMASK(63, 12)
@@ -29,6 +30,11 @@
 #define PRESERVED_FOLIO_PFN(desc)	(((desc) & PRESERVED_PFN_MASK) >> PRESERVED_PFN_SHIFT)
 #define PRESERVED_FOLIO_FLAGS(desc)	((desc) & ~PRESERVED_PFN_MASK)
 #define PRESERVED_FOLIO_MKDESC(pfn, flags) (((pfn) << PRESERVED_PFN_SHIFT) | (flags))
+
+struct memfd_luo_private {
+	struct memfd_luo_folio_ser *pfolios;
+	u64 nr_folios;
+};
 
 static int memfd_luo_preserve_folios(struct memfd_luo_folio_ser *pfolios,
 				     struct folio **folios,
@@ -67,9 +73,9 @@ err_unpreserve:
 }
 
 static void memfd_luo_unpreserve_folios(const struct memfd_luo_folio_ser *pfolios,
-					unsigned int nr_folios)
+					u64 nr_folios)
 {
-	unsigned int i;
+	long i;
 
 	for (i = 0; i < nr_folios; i++) {
 		const struct memfd_luo_folio_ser *pfolio = &pfolios[i];
@@ -85,23 +91,50 @@ static void memfd_luo_unpreserve_folios(const struct memfd_luo_folio_ser *pfolio
 	}
 }
 
-static void *memfd_luo_create_fdt(unsigned long size)
+static struct memfd_luo_folio_ser *memfd_luo_fdt_folios(const void *fdt, u64 *nr_folios)
 {
-	unsigned int order = get_order(size);
+	const struct kho_vmalloc *kho_vmalloc;
+	struct memfd_luo_folio_ser *pfolios;
+	const u64 *nr;
+	int len;
+
+	nr = fdt_getprop(fdt, 0, "nr_folios", &len);
+	if (!nr || len != sizeof(*nr)) {
+		pr_err("invalid 'nr_folios' property\n");
+		return NULL;
+	}
+
+	kho_vmalloc = fdt_getprop(fdt, 0, "folios", &len);
+	if (!kho_vmalloc || len != sizeof(*kho_vmalloc)) {
+		pr_err("invalid 'folios' property\n");
+		return NULL;
+	}
+
+	pfolios = kho_restore_vmalloc(kho_vmalloc);
+	if (!pfolios)
+		return NULL;
+
+	*nr_folios = *nr;
+	return pfolios;
+}
+
+static void *memfd_luo_create_fdt(void)
+{
 	struct folio *fdt_folio;
 	int err = 0;
 	void *fdt;
 
-	if (order > MAX_PAGE_ORDER)
-		return NULL;
-
-	fdt_folio = folio_alloc(GFP_KERNEL | __GFP_ZERO, order);
+	/*
+	 * The FDT only contains a couple of properties and a kho_vmalloc
+	 * object. One page should be enough for that.
+	 */
+	fdt_folio = folio_alloc(GFP_KERNEL | __GFP_ZERO, 0);
 	if (!fdt_folio)
 		return NULL;
 
 	fdt = folio_address(fdt_folio);
 
-	err |= fdt_create(fdt, (1 << (order + PAGE_SHIFT)));
+	err |= fdt_create(fdt, folio_size(fdt_folio));
 	err |= fdt_finish_reservemap(fdt);
 	err |= fdt_begin_node(fdt, "");
 	if (err)
@@ -127,15 +160,21 @@ static int memfd_luo_finish_fdt(void *fdt)
 
 static int memfd_luo_preserve(struct liveupdate_file_op_args *args)
 {
-	struct memfd_luo_folio_ser *preserved_folios;
 	struct inode *inode = file_inode(args->file);
-	unsigned int max_folios, nr_folios = 0;
-	int err = 0, preserved_size;
+	struct memfd_luo_folio_ser *pfolios;
+	struct memfd_luo_private *private;
+	struct kho_vmalloc *kho_vmalloc;
+	unsigned int max_folios;
 	struct folio **folios;
 	long size, nr_pinned;
 	pgoff_t offset;
+	int err = 0;
 	void *fdt;
-	u64 pos;
+	u64 pos, nr_folios;
+
+	private = kmalloc(sizeof(*private), GFP_KERNEL);
+	if (!private)
+		return -ENOMEM;
 
 	inode_lock(inode);
 	shmem_i_mapping_freeze(inode, true);
@@ -176,21 +215,9 @@ static int memfd_luo_preserve(struct liveupdate_file_op_args *args)
 		pr_err("failed to pin folios: %d\n", err);
 		goto err_free_folios;
 	}
-	/* nr_pinned won't be more than max_folios which is also unsigned int. */
-	nr_folios = (unsigned int)nr_pinned;
+	nr_folios = nr_pinned;
 
-	preserved_size = sizeof(struct memfd_luo_folio_ser) * nr_folios;
-	if (check_mul_overflow(sizeof(struct memfd_luo_folio_ser),
-			       nr_folios, &preserved_size)) {
-		err = -E2BIG;
-		goto err_unpin;
-	}
-
-	/*
-	 * Most of the space should be taken by preserved folios. So take its
-	 * size, plus a page for other properties.
-	 */
-	fdt = memfd_luo_create_fdt(PAGE_ALIGN(preserved_size) + PAGE_SIZE);
+	fdt = memfd_luo_create_fdt();
 	if (!fdt) {
 		err = -ENOMEM;
 		goto err_unpin;
@@ -205,8 +232,12 @@ static int memfd_luo_preserve(struct liveupdate_file_op_args *args)
 	if (err)
 		goto err_free_fdt;
 
-	err = fdt_property_placeholder(fdt, MEMFD_FDT_FOLIOS, preserved_size,
-				       (void **)&preserved_folios);
+	err = fdt_property(fdt, "nr_folios", &nr_folios, sizeof(nr_folios));
+	if (err)
+		goto err_free_fdt;
+
+	err = fdt_property_placeholder(fdt, "folios", sizeof(*kho_vmalloc),
+				       (void **)&kho_vmalloc);
 	if (err) {
 		pr_err("Failed to reserve folios property in FDT: %s\n",
 		       fdt_strerror(err));
@@ -214,36 +245,52 @@ static int memfd_luo_preserve(struct liveupdate_file_op_args *args)
 		goto err_free_fdt;
 	}
 
-	err = memfd_luo_preserve_folios(preserved_folios, folios, nr_folios);
-	if (err)
+	pfolios = vcalloc(nr_folios, sizeof(*pfolios));
+	if (!pfolios)
 		goto err_free_fdt;
+
+	err = memfd_luo_preserve_folios(pfolios, folios, nr_folios);
+	if (err)
+		goto err_free_pfolios;
+
+	err = kho_preserve_vmalloc(pfolios, kho_vmalloc);
+	if (err)
+		goto err_unpreserve_folios;
 
 	err = memfd_luo_finish_fdt(fdt);
 	if (err)
-		goto err_unpreserve;
+		goto err_unpreserve_vmalloc;
 
 	err = kho_preserve_folio(virt_to_folio(fdt));
 	if (err)
-		goto err_unpreserve;
+		goto err_unpreserve_vmalloc;
 
 	kvfree(folios);
 	inode_unlock(inode);
 
+	private->pfolios = pfolios;
+	private->nr_folios = nr_folios;
+	args->private_data = private;
 	args->serialized_data = virt_to_phys(fdt);
 	return 0;
 
-err_unpreserve:
-	memfd_luo_unpreserve_folios(preserved_folios, nr_folios);
+err_unpreserve_vmalloc:
+	kho_unpreserve_vmalloc(kho_vmalloc);
+err_unpreserve_folios:
+	memfd_luo_unpreserve_folios(pfolios, nr_folios);
+err_free_pfolios:
+	vfree(pfolios);
 err_free_fdt:
 	folio_put(virt_to_folio(fdt));
 err_unpin:
-	unpin_folios(folios, nr_pinned);
+	unpin_folios(folios, nr_folios);
 err_free_folios:
 	kvfree(folios);
 err_unfreeze:
 	shmem_i_mapping_freeze(inode, false);
 err_unlock:
 	inode_unlock(inode);
+	kfree(private);
 	return err;
 }
 
@@ -271,13 +318,13 @@ static int memfd_luo_freeze(struct liveupdate_file_op_args *args)
 
 static void memfd_luo_unpreserve(struct liveupdate_file_op_args *args)
 {
-	const struct memfd_luo_folio_ser *pfolios;
+	struct memfd_luo_private *private = args->private_data;
+	const struct kho_vmalloc *vmalloc_handle;
 	struct inode *inode = file_inode(args->file);
 	struct folio *fdt_folio;
 	void *fdt;
-	int len;
 
-	if (WARN_ON_ONCE(!args->serialized_data))
+	if (WARN_ON_ONCE(!args->serialized_data || !args->private_data))
 		return;
 
 	inode_lock(inode);
@@ -285,12 +332,21 @@ static void memfd_luo_unpreserve(struct liveupdate_file_op_args *args)
 
 	fdt = phys_to_virt(args->serialized_data);
 	fdt_folio = virt_to_folio(fdt);
-	pfolios = fdt_getprop(fdt, 0, "folios", &len);
-	if (pfolios)
-		memfd_luo_unpreserve_folios(pfolios, len / sizeof(*pfolios));
+
+	vmalloc_handle = fdt_getprop(fdt, 0, "folios", NULL);
+	/*
+	 * Less error checks here since FDT was created by this kernel so
+	 * expecting it to be sane.
+	 */
+	WARN_ON_ONCE(!vmalloc_handle);
+	if (vmalloc_handle)
+		kho_unpreserve_vmalloc((struct kho_vmalloc *)vmalloc_handle);
+
+	memfd_luo_unpreserve_folios(private->pfolios, private->nr_folios);
 
 	kho_unpreserve_folio(fdt_folio);
 	folio_put(fdt_folio);
+	vfree(private->pfolios);
 	inode_unlock(inode);
 }
 
@@ -300,7 +356,7 @@ static struct folio *memfd_luo_get_fdt(u64 data)
 }
 
 static void memfd_luo_discard_folios(const struct memfd_luo_folio_ser *pfolios,
-				     unsigned int nr_folios)
+				     long nr_folios)
 {
 	unsigned int i;
 
@@ -328,30 +384,42 @@ static void memfd_luo_finish(struct liveupdate_file_op_args *args)
 {
 	const struct memfd_luo_folio_ser *pfolios;
 	struct folio *fdt_folio;
-	int len;
+	const void *fdt;
+	u64 nr_folios;
 
 	if (args->retrieved)
 		return;
 
 	fdt_folio = memfd_luo_get_fdt(args->serialized_data);
+	if (!fdt_folio) {
+		pr_err("failed to restore memfd FDT\n");
+		return;
+	}
 
-	pfolios = fdt_getprop(folio_address(fdt_folio), 0, "folios", &len);
-	if (pfolios)
-		memfd_luo_discard_folios(pfolios, len / sizeof(*pfolios));
+	fdt = folio_address(fdt_folio);
 
+	pfolios = memfd_luo_fdt_folios(fdt, &nr_folios);
+	if (!pfolios)
+		goto out;
+
+	memfd_luo_discard_folios(pfolios, nr_folios);
+	vfree(pfolios);
+
+out:
 	folio_put(fdt_folio);
 }
 
 static int memfd_luo_retrieve(struct liveupdate_file_op_args *args)
 {
 	const struct memfd_luo_folio_ser *pfolios;
-	int nr_pfolios, len, ret = 0, i = 0;
 	struct address_space *mapping;
 	struct folio *folio, *fdt_folio;
+	int len, ret = 0, i = 0;
 	const u64 *pos, *size;
 	struct inode *inode;
 	struct file *file;
 	const void *fdt;
+	u64 nr_folios;
 
 	fdt_folio = memfd_luo_get_fdt(args->serialized_data);
 	if (!fdt_folio)
@@ -359,13 +427,12 @@ static int memfd_luo_retrieve(struct liveupdate_file_op_args *args)
 
 	fdt = page_to_virt(folio_page(fdt_folio, 0));
 
-	pfolios = fdt_getprop(fdt, 0, "folios", &len);
-	if (!pfolios || len % sizeof(*pfolios)) {
-		pr_err("invalid 'folios' property\n");
+	pfolios = memfd_luo_fdt_folios(fdt, &nr_folios);
+	if (!pfolios) {
+		pr_err("failed to fetch preserved folio list\n");
 		ret = -EINVAL;
 		goto put_fdt;
 	}
-	nr_pfolios = len / sizeof(*pfolios);
 
 	size = fdt_getprop(fdt, 0, "size", &len);
 	if (!size || len != sizeof(u64)) {
@@ -393,7 +460,7 @@ static int memfd_luo_retrieve(struct liveupdate_file_op_args *args)
 	mapping = inode->i_mapping;
 	vfs_setpos(file, *pos, MAX_LFS_FILESIZE);
 
-	for (; i < nr_pfolios; i++) {
+	for (; i < nr_folios; i++) {
 		const struct memfd_luo_folio_ser *pfolio = &pfolios[i];
 		phys_addr_t phys;
 		u64 index;
@@ -452,6 +519,7 @@ static int memfd_luo_retrieve(struct liveupdate_file_op_args *args)
 	inode->i_size = *size;
 	args->file = file;
 	folio_put(fdt_folio);
+	vfree(pfolios);
 	return 0;
 
 unlock_folio:
@@ -461,7 +529,7 @@ put_file:
 	fput(file);
 	i++;
 put_folios:
-	for (; i < nr_pfolios; i++) {
+	for (; i < nr_folios; i++) {
 		const struct memfd_luo_folio_ser *pfolio = &pfolios[i];
 
 		folio = kho_restore_folio(PRESERVED_FOLIO_PFN(pfolio->foliodesc));
@@ -469,6 +537,7 @@ put_folios:
 			folio_put(folio);
 	}
 
+	vfree(pfolios);
 put_fdt:
 	folio_put(fdt_folio);
 	return ret;
