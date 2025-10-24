@@ -111,8 +111,7 @@ struct luo_file_ser {
  *                 operations specific to this file's type.
  * @file:          A pointer to the kernel's &struct file object representing
  *                 the open file descriptor that is being preserved.
- * @private_data:  Internal storage used by the live update core framework
- *                 between phases.
+ * @data:          Handle to the serialized state of the file.
  * @reclaimed:     Flag indicating whether this preserved file descriptor has
  *                 been successfully 'reclaimed' (e.g., requested via an ioctl)
  *                 by user-space or the owning kernel subsystem in the new
@@ -131,13 +130,13 @@ struct luo_file_ser {
  * update process. Instances of this structure are typically allocated,
  * populated with file-specific details (&file, &arg, callbacks, compatibility
  * string, token), and linked into a central list managed by the LUO. The
- * private_data field is used internally by the core logic to store state
- * between phases.
+ * data field is used by file handlers to store a handle (physical address of
+ * page for example) to the serialized state of the file.
  */
 struct luo_file {
 	struct liveupdate_file_handler *fh;
 	struct file *file;
-	u64 private_data;
+	u64 data;
 	bool reclaimed;
 	enum liveupdate_state state;
 	struct mutex mutex;
@@ -157,11 +156,11 @@ static int luo_file_prepare_one(struct luo_session *session, struct luo_file *h)
 			args.handler = h->fh;
 			args.session = (struct liveupdate_session *)session;
 			args.file = h->file;
-			args.data = h->private_data;
+			args.data = h->data;
 
 			ret = h->fh->ops->prepare(&args);
 			if (!ret)
-				h->private_data = args.data;
+				h->data = args.data;
 		}
 		if (!ret)
 			h->state = LIVEUPDATE_STATE_PREPARED;
@@ -185,11 +184,11 @@ static int luo_file_freeze_one(struct luo_session *session, struct luo_file *h)
 			args.handler = h->fh;
 			args.session = (struct liveupdate_session *)session;
 			args.file = h->file;
-			args.data = h->private_data;
+			args.data = h->data;
 
 			ret = h->fh->ops->freeze(&args);
 			if (!ret)
-				h->private_data = args.data;
+				h->data = args.data;
 		}
 		if (!ret)
 			h->state = LIVEUPDATE_STATE_FROZEN;
@@ -210,7 +209,7 @@ static void luo_file_finish_one(struct luo_session *session, struct luo_file *h)
 			args.handler = h->fh;
 			args.session = (struct liveupdate_session *)session;
 			args.file = h->file;
-			args.data = h->private_data;
+			args.data = h->data;
 			args.reclaimed = h->reclaimed;
 
 			h->fh->ops->finish(&args);
@@ -238,12 +237,12 @@ static void luo_file_cancel_one(struct luo_session *session, struct luo_file *h)
 		args.handler = h->fh;
 		args.session = (struct liveupdate_session *)session;
 		args.file = h->file;
-		args.data = h->private_data;
+		args.data = h->data;
 
 		h->fh->ops->cancel(&args);
 	}
 
-	h->private_data = 0;
+	h->data = 0;
 	h->state = LIVEUPDATE_STATE_NORMAL;
 }
 
@@ -282,7 +281,7 @@ int luo_file_prepare(struct luo_session *session)
 
 		strscpy(ser[i].compatible, luo_file->fh->compatible,
 			sizeof(ser[i].compatible));
-		ser[i].data = luo_file->private_data;
+		ser[i].data = luo_file->data;
 		ser[i].token = luo_file->token;
 		i++;
 	}
@@ -322,7 +321,7 @@ int luo_file_freeze(struct luo_session *session)
 			       session->name, luo_file->token, luo_file->fh->compatible, ret);
 			goto exit_cleanup;
 		}
-		ser[i].data = luo_file->private_data;
+		ser[i].data = luo_file->data;
 		i++;
 	}
 
@@ -402,7 +401,7 @@ void luo_file_deserialize(struct luo_session *session)
 				   GFP_KERNEL | __GFP_NOFAIL);
 		luo_file->fh = fh;
 		luo_file->file = NULL;
-		luo_file->private_data = ser[i].data;
+		luo_file->data = ser[i].data;
 		luo_file->token = ser[i].token;
 		luo_file->reclaimed = false;
 		mutex_init(&luo_file->mutex);
@@ -474,7 +473,7 @@ int luo_preserve_file(struct luo_session *session, u64 token, int fd)
 		mutex_destroy(&luo_file->mutex);
 		kfree(luo_file);
 	} else {
-		luo_file->private_data = args.data;
+		luo_file->data = args.data;
 		list_add_tail(&luo_file->list, &session->files_list);
 		atomic_inc(&luo_file->fh->count);
 		session->count++;
@@ -526,7 +525,7 @@ int luo_unpreserve_file(struct luo_session *session, u64 token)
 		args.handler = last_file->fh;
 		args.session = (struct liveupdate_session *)session;
 		args.file = last_file->file;
-		args.data = last_file->private_data;
+		args.data = last_file->data;
 		last_file->fh->ops->unpreserve(&args);
 	}
 
@@ -587,7 +586,7 @@ int luo_retrieve_file(struct luo_session *session, u64 token,
 
 	args.handler = luo_file->fh;
 	args.session = (struct liveupdate_session *)session;
-	args.data = luo_file->private_data;
+	args.data = luo_file->data;
 	ret = luo_file->fh->ops->retrieve(&args);
 	if (!ret) {
 		luo_file->file = args.file;
@@ -655,7 +654,7 @@ long luo_file_query(struct luo_session *session,
 		if (luo_file->fh == h) {
 			fds[found].session_name = session->name;
 			fds[found].token = luo_file->token;
-			fds[found].data = luo_file->private_data;
+			fds[found].data = luo_file->data;
 			found++;
 		}
 	}
