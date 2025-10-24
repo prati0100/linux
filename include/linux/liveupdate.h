@@ -27,6 +27,8 @@ struct file;
  * @handler:   The file handler being called.
  * @session:   The session this file belongs to.
  * @reclaimed: The reclaimed status for the 'finish' operation.
+ * @private:   The private data for the file. Used to hold runtime state that is
+ *             not preserved. Set by the callback.
  * @data:      The opaque u64 handle.
  *             - preserve/prepare/freeze may update this field.
  * @file:      The file object.
@@ -38,6 +40,7 @@ struct liveupdate_file_op_args {
 	struct liveupdate_file_handler *handler;
 	struct liveupdate_session *session;
 	bool reclaimed;
+	void *private;
 	u64 data;
 	struct file *file;
 };
@@ -64,6 +67,7 @@ struct liveupdate_file_op_args {
  * @global_state_restore: Optional. Restores the global state object.
  * @global_state_destroy: Optional. Destroys the global state object.
  * @owner:                Module reference
+ * @private_size:         Optional. Size of file private data.
  */
 struct liveupdate_file_ops {
 	bool (*can_preserve)(struct liveupdate_file_handler *handler,
@@ -82,6 +86,7 @@ struct liveupdate_file_ops {
 	void (*global_state_destroy)(struct liveupdate_file_handler *h,
 				     void *obj);
 	struct module *owner;
+	unsigned long private_size;
 };
 
 /* The max size is set so it can be reliably used during in serialization */

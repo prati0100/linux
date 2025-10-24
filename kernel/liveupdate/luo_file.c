@@ -111,6 +111,7 @@ struct luo_file_ser {
  *                 operations specific to this file's type.
  * @file:          A pointer to the kernel's &struct file object representing
  *                 the open file descriptor that is being preserved.
+ * @private:       A pointer to the liveupdate_file_handler's private data.
  * @data:          Handle to the serialized state of the file.
  * @reclaimed:     Flag indicating whether this preserved file descriptor has
  *                 been successfully 'reclaimed' (e.g., requested via an ioctl)
@@ -136,6 +137,7 @@ struct luo_file_ser {
 struct luo_file {
 	struct liveupdate_file_handler *fh;
 	struct file *file;
+	void *private;
 	u64 data;
 	bool reclaimed;
 	enum liveupdate_state state;
@@ -157,6 +159,7 @@ static int luo_file_prepare_one(struct luo_session *session, struct luo_file *h)
 			args.session = (struct liveupdate_session *)session;
 			args.file = h->file;
 			args.data = h->data;
+			args.private = h->private;
 
 			ret = h->fh->ops->prepare(&args);
 			if (!ret)
@@ -185,6 +188,7 @@ static int luo_file_freeze_one(struct luo_session *session, struct luo_file *h)
 			args.session = (struct liveupdate_session *)session;
 			args.file = h->file;
 			args.data = h->data;
+			args.private = h->private;
 
 			ret = h->fh->ops->freeze(&args);
 			if (!ret)
@@ -210,6 +214,7 @@ static void luo_file_finish_one(struct luo_session *session, struct luo_file *h)
 			args.session = (struct liveupdate_session *)session;
 			args.file = h->file;
 			args.data = h->data;
+			args.private = h->private;
 			args.reclaimed = h->reclaimed;
 
 			h->fh->ops->finish(&args);
@@ -238,6 +243,7 @@ static void luo_file_cancel_one(struct luo_session *session, struct luo_file *h)
 		args.session = (struct liveupdate_session *)session;
 		args.file = h->file;
 		args.data = h->data;
+		args.private = h->private;
 
 		h->fh->ops->cancel(&args);
 	}
@@ -400,6 +406,9 @@ void luo_file_deserialize(struct luo_session *session)
 		luo_file = kzalloc(sizeof(*luo_file),
 				   GFP_KERNEL | __GFP_NOFAIL);
 		luo_file->fh = fh;
+		if (fh->ops->private_size)
+			luo_file->private = kzalloc(fh->ops->private_size,
+						    GFP_KERNEL | __GFP_NOFAIL);
 		luo_file->file = NULL;
 		luo_file->data = ser[i].data;
 		luo_file->token = ser[i].token;
@@ -465,12 +474,25 @@ int luo_preserve_file(struct luo_session *session, u64 token, int fd)
 	luo_file->state = LIVEUPDATE_STATE_NORMAL;
 	mutex_init(&luo_file->mutex);
 
+	if (fh->ops->private_size) {
+		void *private = kzalloc(fh->ops->private_size, GFP_KERNEL);
+		if (!private) {
+			kfree(luo_file);
+			ret = -ENOMEM;
+			goto exit_fput;
+		}
+
+		luo_file->private = private;
+	}
+
 	args.handler = fh;
 	args.session = (struct liveupdate_session *)session;
 	args.file = file;
+	args.private = luo_file->private;
 	ret = fh->ops->preserve(&args);
 	if (ret) {
 		mutex_destroy(&luo_file->mutex);
+		kfree(luo_file->private);
 		kfree(luo_file);
 	} else {
 		luo_file->data = args.data;
@@ -526,6 +548,7 @@ int luo_unpreserve_file(struct luo_session *session, u64 token)
 		args.session = (struct liveupdate_session *)session;
 		args.file = last_file->file;
 		args.data = last_file->data;
+		args.private = last_file->private;
 		last_file->fh->ops->unpreserve(&args);
 	}
 
@@ -540,6 +563,7 @@ int luo_unpreserve_file(struct luo_session *session, u64 token)
 		if (atomic_dec_and_test(&last_file->fh->count))
 			__luo_fh_global_state_destroy(last_file->fh);
 	}
+	kfree(last_file->private);
 	kfree(last_file);
 
 	return 0;
@@ -587,6 +611,7 @@ int luo_retrieve_file(struct luo_session *session, u64 token,
 	args.handler = luo_file->fh;
 	args.session = (struct liveupdate_session *)session;
 	args.data = luo_file->data;
+	args.private = luo_file->private;
 	ret = luo_file->fh->ops->retrieve(&args);
 	if (!ret) {
 		luo_file->file = args.file;
@@ -638,6 +663,7 @@ void luo_file_unpreserve_unreclaimed_files(struct luo_session *session)
 				if (atomic_dec_and_test(&h->fh->count))
 					__luo_fh_global_state_destroy(h->fh);
 			}
+			kfree(h->private);
 			kfree(h);
 		}
 	}
