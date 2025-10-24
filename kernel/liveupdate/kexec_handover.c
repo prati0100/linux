@@ -993,6 +993,50 @@ err_free:
 EXPORT_SYMBOL_GPL(kho_preserve_vmalloc);
 
 /**
+ * kho_unpreserve_vmalloc - unpreserve vmalloc memory.
+ * @preservation: preservation metadata.
+ *
+ * Unpreserves an area in vmalloc address space that was preserved using
+ * kho_preserve_vmalloc().
+ *
+ * Return: 0 on success, -errno on failure.
+ */
+int kho_unpreserve_vmalloc(const struct kho_vmalloc *preservation)
+{
+	struct kho_vmalloc_chunk *chunk = KHOSER_LOAD_PTR(preservation->first);
+	unsigned int contig_pages = (1 << preservation->order);
+	int err;
+
+	while (chunk) {
+		struct page *page;
+
+		for (int i = 0; i < ARRAY_SIZE(chunk->phys) && chunk->phys[i]; i++) {
+			phys_addr_t phys = chunk->phys[i];
+			int err;
+
+			err = kho_unpreserve_pages(phys_to_page(phys), contig_pages);
+			/*
+			 * This usually happens when KHO is finalized. Stop now
+			 * since later calls will also fail.
+			 */
+			if (err)
+				return err;
+		}
+
+		page = virt_to_page(chunk);
+		err = kho_unpreserve_pages(page, 1);
+		if (err)
+			return err;
+
+		chunk = KHOSER_LOAD_PTR(chunk->hdr.next);
+		__free_page(page);
+	}
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(kho_unpreserve_vmalloc);
+
+/**
  * kho_restore_vmalloc - recreates and populates an area in vmalloc address
  * space from the preserved memory.
  * @preservation: preservation metadata.
