@@ -121,10 +121,10 @@ static LIST_HEAD(luo_file_handler_list);
  * @file:          Pointer to the kernel's &struct file that is being preserved.
  *                 This is NULL in the new kernel until the file is successfully
  *                 retrieved.
- * @private_data:  The opaque u64 handle returned by the handler's .preserve()
- *                 op. This handle is passed back to the handler's .freeze(),
+ * @serialized_data: The opaque u64 handle to the serialized state of the file.
+ *                 This handle is passed back to the handler's .freeze(),
  *                 .retrieve(), and .finish() callbacks, allowing it to track
- *                 its private state across phases.
+ *                 and update its serialized state across phases.
  * @retrieved:     A flag indicating whether a user/kernel in the new kernel has
  *                 successfully called retrieve() on this file. This prevents
  *                 multiple retrieval attempts.
@@ -136,21 +136,21 @@ static LIST_HEAD(luo_file_handler_list);
  * @token:         The user-provided unique token used to identify this file.
  *
  * This structure is the core in-kernel representation of a single file being
- * managed through a live update. An instance is created by
- * luo_preserve_file() to link a 'struct file' to its corresponding handler, a
- * user-provided token, and the state handle returned by the handler's
- * .preserve() operation.
+ * managed through a live update. An instance is created by luo_preserve_file()
+ * to link a 'struct file' to its corresponding handler, a user-provided token,
+ * and the serialized state handle returned by the handler's .preserve()
+ * operation.
  *
- * These instances are tracked in a per-session list. The @private_data field,
- * which holds the handler's state, may be updated during the .freeze()
- * callback before being serialized for the next kernel. After reboot, these
- * structures are recreated by luo_file_deserialize() and are finally cleaned
- * up by luo_file_finish().
+ * These instances are tracked in a per-session list. The @serialized_data
+ * field, which holds a handle to the file's serialized state, may be updated
+ * during the .freeze() callback before being serialized for the next kernel.
+ * After reboot, these structures are recreated by luo_file_deserialize() and
+ * are finally cleaned up by luo_file_finish().
  */
 struct luo_file {
 	struct liveupdate_file_handler *fh;
 	struct file *file;
-	u64 private_data;
+	u64 serialized_data;
 	bool retrieved;
 	struct mutex mutex;
 	struct list_head list;
@@ -306,7 +306,7 @@ int luo_preserve_file(struct luo_session *session, u64 token, int fd)
 		luo_flb_file_unpreserve(fh);
 		goto exit_err;
 	} else {
-		luo_file->private_data = args.data;
+		luo_file->serialized_data = args.serialized_data;
 		list_add_tail(&luo_file->list, &session->files_list);
 		session->count++;
 	}
@@ -353,7 +353,7 @@ void luo_file_unpreserve_files(struct luo_session *session)
 		args.handler = luo_file->fh;
 		args.session = (struct liveupdate_session *)session;
 		args.file = luo_file->file;
-		args.data = luo_file->private_data;
+		args.serialized_data = luo_file->serialized_data;
 		luo_file->fh->ops->unpreserve(&args);
 		luo_flb_file_unpreserve(luo_file->fh);
 
@@ -381,11 +381,11 @@ static int luo_file_freeze_one(struct luo_session *session,
 		args.handler = luo_file->fh;
 		args.session = (struct liveupdate_session *)session;
 		args.file = luo_file->file;
-		args.data = luo_file->private_data;
+		args.serialized_data = luo_file->serialized_data;
 
 		err = luo_file->fh->ops->freeze(&args);
 		if (!err)
-			luo_file->private_data = args.data;
+			luo_file->serialized_data = args.serialized_data;
 	}
 
 	return err;
@@ -402,12 +402,12 @@ static void luo_file_unfreeze_one(struct luo_session *session,
 		args.handler = luo_file->fh;
 		args.session = (struct liveupdate_session *)session;
 		args.file = luo_file->file;
-		args.data = luo_file->private_data;
+		args.serialized_data = luo_file->serialized_data;
 
 		luo_file->fh->ops->unfreeze(&args);
 	}
 
-	luo_file->private_data = 0;
+	luo_file->serialized_data = 0;
 }
 
 static void __luo_file_unfreeze(struct luo_session *session,
@@ -485,7 +485,7 @@ int luo_file_freeze(struct luo_session *session)
 
 		strscpy(file_ser[i].compatible, luo_file->fh->compatible,
 			sizeof(file_ser[i].compatible));
-		file_ser[i].data = luo_file->private_data;
+		file_ser[i].data = luo_file->serialized_data;
 		file_ser[i].token = luo_file->token;
 		i++;
 	}
@@ -581,7 +581,7 @@ int luo_retrieve_file(struct luo_session *session, u64 token,
 
 	args.handler = luo_file->fh;
 	args.session = (struct liveupdate_session *)session;
-	args.data = luo_file->private_data;
+	args.serialized_data = luo_file->serialized_data;
 	err = luo_file->fh->ops->retrieve(&args);
 	if (!err) {
 		luo_file->file = args.file;
@@ -608,7 +608,7 @@ static int luo_file_can_finish_one(struct luo_session *session,
 		args.handler = luo_file->fh;
 		args.session = (struct liveupdate_session *)session;
 		args.file = luo_file->file;
-		args.data = luo_file->private_data;
+		args.serialized_data = luo_file->serialized_data;
 		args.retrieved = luo_file->retrieved;
 		can_finish = luo_file->fh->ops->can_finish(&args);
 	}
@@ -626,7 +626,7 @@ static void luo_file_finish_one(struct luo_session *session,
 	args.handler = luo_file->fh;
 	args.session = (struct liveupdate_session *)session;
 	args.file = luo_file->file;
-	args.data = luo_file->private_data;
+	args.serialized_data = luo_file->serialized_data;
 	args.retrieved = luo_file->retrieved;
 	luo_flb_file_finish(luo_file->fh);
 
@@ -764,7 +764,7 @@ int luo_file_deserialize(struct luo_session *session)
 
 		luo_file->fh = fh;
 		luo_file->file = NULL;
-		luo_file->private_data = file_ser[i].data;
+		luo_file->serialized_data = file_ser[i].data;
 		luo_file->token = file_ser[i].token;
 		luo_file->retrieved = false;
 		mutex_init(&luo_file->mutex);

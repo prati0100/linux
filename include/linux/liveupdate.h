@@ -38,7 +38,7 @@ struct liveupdate_file_op_args {
 	struct liveupdate_session *session;
 	bool retrieved;
 	struct file *file;
-	u64 data;
+	u64 serialized_data;
 };
 
 /**

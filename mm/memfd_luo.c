@@ -229,7 +229,7 @@ static int memfd_luo_preserve(struct liveupdate_file_op_args *args)
 	kvfree(folios);
 	inode_unlock(inode);
 
-	args->data = virt_to_phys(fdt);
+	args->serialized_data = virt_to_phys(fdt);
 	return 0;
 
 err_unpreserve:
@@ -253,10 +253,10 @@ static int memfd_luo_freeze(struct liveupdate_file_op_args *args)
 	void *fdt;
 	int err;
 
-	if (WARN_ON_ONCE(!args->data))
+	if (WARN_ON_ONCE(!args->serialized_data))
 		return -EINVAL;
 
-	fdt = phys_to_virt(args->data);
+	fdt = phys_to_virt(args->serialized_data);
 
 	/*
 	 * The pos might have changed since prepare. Everything else stays the
@@ -277,13 +277,13 @@ static void memfd_luo_unpreserve(struct liveupdate_file_op_args *args)
 	void *fdt;
 	int len;
 
-	if (WARN_ON_ONCE(!args->data))
+	if (WARN_ON_ONCE(!args->serialized_data))
 		return;
 
 	inode_lock(inode);
 	shmem_i_mapping_freeze(inode, false);
 
-	fdt = phys_to_virt(args->data);
+	fdt = phys_to_virt(args->serialized_data);
 	fdt_folio = virt_to_folio(fdt);
 	pfolios = fdt_getprop(fdt, 0, "folios", &len);
 	if (pfolios)
@@ -333,7 +333,7 @@ static void memfd_luo_finish(struct liveupdate_file_op_args *args)
 	if (args->retrieved)
 		return;
 
-	fdt_folio = memfd_luo_get_fdt(args->data);
+	fdt_folio = memfd_luo_get_fdt(args->serialized_data);
 
 	pfolios = fdt_getprop(folio_address(fdt_folio), 0, "folios", &len);
 	if (pfolios)
@@ -353,7 +353,7 @@ static int memfd_luo_retrieve(struct liveupdate_file_op_args *args)
 	struct file *file;
 	const void *fdt;
 
-	fdt_folio = memfd_luo_get_fdt(args->data);
+	fdt_folio = memfd_luo_get_fdt(args->serialized_data);
 	if (!fdt_folio)
 		return -ENOENT;
 
