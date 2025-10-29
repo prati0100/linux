@@ -619,6 +619,8 @@ int luo_retrieve_file(struct luo_session *session, u64 token,
 		get_file(luo_file->file);
 		*filep = luo_file->file;
 		luo_file->reclaimed = true;
+		list_del(&luo_file->list);
+		session->count--;
 	}
 
 	return ret;
