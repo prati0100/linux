@@ -248,7 +248,6 @@ static void luo_file_cancel_one(struct luo_session *session, struct luo_file *h)
 		h->fh->ops->cancel(&args);
 	}
 
-	h->data = 0;
 	h->state = LIVEUPDATE_STATE_NORMAL;
 }
 
