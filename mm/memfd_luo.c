@@ -30,7 +30,7 @@
 #define PRESERVED_FOLIO_FLAGS(desc)	((desc) & ~PRESERVED_PFN_MASK)
 #define PRESERVED_FOLIO_MKDESC(pfn, flags) (((pfn) << PRESERVED_PFN_SHIFT) | (flags))
 
-struct memfd_luo_preserved_folio {
+struct memfd_luo_pfolio {
 	/*
 	 * The folio descriptor is made of 2 parts. The bottom 12 bits are used
 	 * for storing flags, the others for storing the PFN.
@@ -40,18 +40,18 @@ struct memfd_luo_preserved_folio {
 };
 
 struct memfd_luo_private {
-	struct memfd_luo_preserved_folio *pfolios;
+	struct memfd_luo_pfolio *pfolios;
 	u64 nr_folios;
 };
 
-static int memfd_luo_preserve_folios(struct memfd_luo_preserved_folio *pfolios,
+static int memfd_luo_preserve_folios(struct memfd_luo_pfolio *pfolios,
 				     struct folio **folios, u64 nr_folios)
 {
 	int err;
 	long i;
 
 	for (i = 0; i < nr_folios; i++) {
-		struct memfd_luo_preserved_folio *pfolio = &pfolios[i];
+		struct memfd_luo_pfolio *pfolio = &pfolios[i];
 		struct folio *folio = folios[i];
 		unsigned int flags = 0;
 		unsigned long pfn;
@@ -80,13 +80,13 @@ err_unpreserve:
 	return err;
 }
 
-static void memfd_luo_unpreserve_folios(struct memfd_luo_preserved_folio *pfolios,
+static void memfd_luo_unpreserve_folios(struct memfd_luo_pfolio *pfolios,
 					u64 nr_folios)
 {
 	long i;
 
 	for (i = 0; i < nr_folios; i++) {
-		const struct memfd_luo_preserved_folio *pfolio = &pfolios[i];
+		const struct memfd_luo_pfolio *pfolio = &pfolios[i];
 		struct folio *folio;
 
 		if (!pfolio->foliodesc)
@@ -99,10 +99,10 @@ static void memfd_luo_unpreserve_folios(struct memfd_luo_preserved_folio *pfolio
 	}
 }
 
-static struct memfd_luo_preserved_folio *memfd_luo_fdt_folios(const void *fdt, u64 *nr_folios)
+static struct memfd_luo_pfolio *memfd_luo_fdt_folios(const void *fdt, u64 *nr_folios)
 {
 	const struct kho_vmalloc *vmalloc_handle;
-	struct memfd_luo_preserved_folio *pfolios;
+	struct memfd_luo_pfolio *pfolios;
 	const u64 *nr;
 	int len;
 
@@ -170,7 +170,7 @@ static int memfd_luo_preserve(struct liveupdate_file_op_args *args)
 {
 	struct memfd_luo_private *private = args->private;
 	struct inode *inode = file_inode(args->file);
-	struct memfd_luo_preserved_folio *pfolios;
+	struct memfd_luo_pfolio *pfolios;
 	struct kho_vmalloc *kho_vmalloc;
 	unsigned int max_folios;
 	struct folio **folios;
@@ -250,8 +250,10 @@ static int memfd_luo_preserve(struct liveupdate_file_op_args *args)
 	}
 
 	pfolios = vcalloc(nr_folios, sizeof(*pfolios));
-	if (!pfolios)
+	if (!pfolios) {
+		err = -ENOMEM;
 		goto err_free_fdt;
+	}
 	private->pfolios = pfolios;
 	private->nr_folios = nr_folios;
 
@@ -357,14 +359,14 @@ static struct folio *memfd_luo_get_fdt(u64 data)
 	return kho_restore_folio((phys_addr_t)data);
 }
 
-static void memfd_luo_discard_folios(struct memfd_luo_preserved_folio *pfolios,
+static void memfd_luo_discard_folios(struct memfd_luo_pfolio *pfolios,
 				     long nr_folios)
 {
 	
 	unsigned int i;
 
 	for (i = 0; i < nr_folios; i++) {
-		const struct memfd_luo_preserved_folio *pfolio = &pfolios[i];
+		const struct memfd_luo_pfolio *pfolio = &pfolios[i];
 		struct folio *folio;
 		phys_addr_t phys;
 
@@ -385,7 +387,7 @@ static void memfd_luo_discard_folios(struct memfd_luo_preserved_folio *pfolios,
 
 static void memfd_luo_finish(struct liveupdate_file_op_args *args)
 {
-	struct memfd_luo_preserved_folio *pfolios;
+	struct memfd_luo_pfolio *pfolios;
 	struct folio *fdt_folio;
 	const void *fdt;
 	u64 nr_folios;
@@ -414,7 +416,7 @@ out:
 
 static int memfd_luo_retrieve(struct liveupdate_file_op_args *args)
 {
-	struct memfd_luo_preserved_folio *pfolios;
+	struct memfd_luo_pfolio *pfolios;
 	struct address_space *mapping;
 	struct folio *folio, *fdt_folio;
 	int len, ret = 0, i = 0;
@@ -464,7 +466,7 @@ static int memfd_luo_retrieve(struct liveupdate_file_op_args *args)
 	vfs_setpos(file, *pos, MAX_LFS_FILESIZE);
 
 	for (; i < nr_folios; i++) {
-		const struct memfd_luo_preserved_folio *pfolio = &pfolios[i];
+		const struct memfd_luo_pfolio *pfolio = &pfolios[i];
 		phys_addr_t phys;
 		u64 index;
 		int flags;
@@ -533,7 +535,7 @@ put_file:
 	i++;
 put_folios:
 	for (; i < nr_folios; i++) {
-		const struct memfd_luo_preserved_folio *pfolio = &pfolios[i];
+		const struct memfd_luo_pfolio *pfolio = &pfolios[i];
 
 		folio = kho_restore_folio(PRESERVED_FOLIO_PFN(pfolio->foliodesc));
 		if (folio)
