@@ -132,6 +132,7 @@ static struct memfd_luo_folio_ser *memfd_luo_preserve_folios(struct file *file, 
 		goto err_unpreserve;
 
 	kvfree(folios);
+	*nr_foliosp = nr_folios;
 	return pfolios;
 
 err_unpreserve:
