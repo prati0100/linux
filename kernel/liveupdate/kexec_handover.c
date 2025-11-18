@@ -1088,11 +1088,11 @@ void *kho_restore_vmalloc(const struct kho_vmalloc *preservation)
 			phys_addr_t phys = chunk->phys[i];
 
 			if (idx + contig_pages > total_pages)
-				goto err_free_pages_array;
+				goto err_free_pages;
 
 			page = kho_restore_pages(phys, contig_pages);
 			if (!page)
-				goto err_free_pages_array;
+				goto err_free_pages;
 
 			for (int j = 0; j < contig_pages; j++)
 				pages[idx++] = page;
@@ -1102,20 +1102,20 @@ void *kho_restore_vmalloc(const struct kho_vmalloc *preservation)
 
 		page = kho_restore_pages(virt_to_phys(chunk), 1);
 		if (!page)
-			goto err_free_pages_array;
+			goto err_free_pages;
 		chunk = KHOSER_LOAD_PTR(chunk->hdr.next);
 		__free_page(page);
 	}
 
 	if (idx != total_pages)
-		goto err_free_pages_array;
+		goto err_free_pages;
 
 	area = __get_vm_area_node(total_pages * PAGE_SIZE, align, shift,
 				  vm_flags, VMALLOC_START, VMALLOC_END,
 				  NUMA_NO_NODE, GFP_KERNEL,
 				  __builtin_return_address(0));
 	if (!area)
-		goto err_free_pages_array;
+		goto err_free_pages;
 
 	addr = (unsigned long)area->addr;
 	size = get_vm_area_size(area);
@@ -1130,7 +1130,10 @@ void *kho_restore_vmalloc(const struct kho_vmalloc *preservation)
 
 err_free_vm_area:
 	free_vm_area(area);
-err_free_pages_array:
+err_free_pages:
+	for (int i = 0; i < idx; i++)
+		__free_page(pages[i]);
+
 	kvfree(pages);
 	return NULL;
 }
