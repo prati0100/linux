@@ -225,15 +225,6 @@ static void memfd_luo_unpreserve_folios(struct kho_vmalloc *kho_vmalloc,
 	vfree(folios_ser);
 }
 
-static struct memfd_luo_folio_ser *
-memfd_luo_restore_folios_ser(const struct memfd_luo_ser *ser)
-{
-	if (ser->nr_folios == 0)
-		return NULL;
-
-	return kho_restore_vmalloc(&ser->folios);
-}
-
 static int memfd_luo_preserve(struct liveupdate_file_op_args *args)
 {
 	struct inode *inode = file_inode(args->file);
@@ -351,12 +342,14 @@ static void memfd_luo_finish(struct liveupdate_file_op_args *args)
 	if (!ser)
 		return;
 
-	folios_ser = memfd_luo_restore_folios_ser(ser);
-	if (!folios_ser)
-		goto out;
+	if (ser->nr_folios) {
+		folios_ser = kho_restore_vmalloc(&ser->folios);
+		if (!folios_ser)
+			goto out;
 
-	memfd_luo_discard_folios(folios_ser, ser->nr_folios);
-	vfree(folios_ser);
+		memfd_luo_discard_folios(folios_ser, ser->nr_folios);
+		vfree(folios_ser);
+	}
 
 out:
 	kho_restore_free(ser);
@@ -471,8 +464,8 @@ static int memfd_luo_retrieve(struct liveupdate_file_op_args *args)
 	vfs_setpos(file, ser->pos, MAX_LFS_FILESIZE);
 	file->f_inode->i_size = ser->size;
 
-	if (ser->size > 0) {
-		folios_ser = memfd_luo_restore_folios_ser(ser);
+	if (ser->nr_folios) {
+		folios_ser = kho_restore_vmalloc(&ser->folios);
 		if (!folios_ser) {
 			err = -EINVAL;
 			goto put_file;
