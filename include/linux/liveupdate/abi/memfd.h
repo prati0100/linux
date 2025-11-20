@@ -29,12 +29,30 @@
  */
 
 /**
+ * MEMFD_LUO_FOLIO_DIRTY - The folio is dirty.
+ *
+ * This flag indicates the folio contains data from user. A non-dirty folio is
+ * one that was allocated (say using fallocate(2)) but not written to.
+ */
+#define MEMFD_LUO_FOLIO_DIRTY		BIT(0)
+
+/**
+ * MEMFD_LUO_FOLIO_UPTODATE - The folio is up-to-date.
+ *
+ * An up-to-date folio has been zeroed out. shmem zeroes out folios on first
+ * use. This flag tracks which folios need zeroing.
+ */
+#define MEMFD_LUO_FOLIO_UPTODATE	BIT(1)
+
+/**
  * struct memfd_luo_folio_ser - Serialized state of a single folio.
- * @foliodesc: A packed 64-bit value containing both the PFN and status flags.
+ * @pfn:       The page frame number of the folio.
+ * @flags:     Flags to describe the state of the folio.
  * @index:     The page offset (pgoff_t) of the folio within the original file.
  */
 struct memfd_luo_folio_ser {
-	u64 foliodesc;
+	u64 pfn:52;
+	u64 flags:12;
 	u64 index;
 } __packed;
 

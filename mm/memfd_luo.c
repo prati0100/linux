@@ -80,15 +80,6 @@
 #include <linux/vmalloc.h>
 #include "internal.h"
 
-#define PRESERVED_PFN_MASK		GENMASK(63, 12)
-#define PRESERVED_PFN_SHIFT		12
-#define PRESERVED_FLAG_DIRTY		BIT(0)
-#define PRESERVED_FLAG_UPTODATE		BIT(1)
-
-#define PRESERVED_FOLIO_PFN(desc)	(((desc) & PRESERVED_PFN_MASK) >> PRESERVED_PFN_SHIFT)
-#define PRESERVED_FOLIO_FLAGS(desc)	((desc) & ~PRESERVED_PFN_MASK)
-#define PRESERVED_FOLIO_MKDESC(pfn, flags) (((pfn) << PRESERVED_PFN_SHIFT) | (flags))
-
 static int memfd_luo_preserve_folios(struct file *file,
 				     struct kho_vmalloc *kho_vmalloc,
 				     struct memfd_luo_folio_ser **out_folios_ser,
@@ -155,19 +146,18 @@ static int memfd_luo_preserve_folios(struct file *file,
 		struct memfd_luo_folio_ser *pfolio = &folios_ser[i];
 		struct folio *folio = folios[i];
 		unsigned int flags = 0;
-		unsigned long pfn;
 
 		err = kho_preserve_folio(folio);
 		if (err)
 			goto err_unpreserve;
 
-		pfn = folio_pfn(folio);
 		if (folio_test_dirty(folio))
-			flags |= PRESERVED_FLAG_DIRTY;
+			flags |= MEMFD_LUO_FOLIO_DIRTY;
 		if (folio_test_uptodate(folio))
-			flags |= PRESERVED_FLAG_UPTODATE;
+			flags |= MEMFD_LUO_FOLIO_UPTODATE;
 
-		pfolio->foliodesc = PRESERVED_FOLIO_MKDESC(pfn, flags);
+		pfolio->pfn = folio_pfn(folio);
+		pfolio->flags = flags;
 		pfolio->index = folio->index;
 	}
 
@@ -213,10 +203,10 @@ static void memfd_luo_unpreserve_folios(struct kho_vmalloc *kho_vmalloc,
 		const struct memfd_luo_folio_ser *pfolio = &folios_ser[i];
 		struct folio *folio;
 
-		if (!pfolio->foliodesc)
+		if (!pfolio->pfn)
 			continue;
 
-		folio = pfn_folio(PRESERVED_FOLIO_PFN(pfolio->foliodesc));
+		folio = pfn_folio(pfolio->pfn);
 
 		kho_unpreserve_folio(folio);
 		unpin_folio(folio);
@@ -315,10 +305,10 @@ static void memfd_luo_discard_folios(const struct memfd_luo_folio_ser *folios_se
 		struct folio *folio;
 		phys_addr_t phys;
 
-		if (!pfolio->foliodesc)
+		if (!pfolio->pfn)
 			continue;
 
-		phys = PFN_PHYS(PRESERVED_FOLIO_PFN(pfolio->foliodesc));
+		phys = PFN_PHYS(pfolio->pfn);
 		folio = kho_restore_folio(phys);
 		if (!folio) {
 			pr_warn_ratelimited("Unable to restore folio at physical address: %llx\n",
@@ -371,10 +361,10 @@ static int memfd_luo_retrieve_folios(struct file *file,
 		u64 index;
 		int flags;
 
-		if (!pfolio->foliodesc)
+		if (!pfolio->pfn)
 			continue;
 
-		phys = PFN_PHYS(PRESERVED_FOLIO_PFN(pfolio->foliodesc));
+		phys = PFN_PHYS(pfolio->pfn);
 		folio = kho_restore_folio(phys);
 		if (!folio) {
 			pr_err("Unable to restore folio at physical address: %llx\n",
@@ -382,7 +372,7 @@ static int memfd_luo_retrieve_folios(struct file *file,
 			goto put_folios;
 		}
 		index = pfolio->index;
-		flags = PRESERVED_FOLIO_FLAGS(pfolio->foliodesc);
+		flags = pfolio->flags;
 
 		/* Set up the folio for insertion. */
 		__folio_set_locked(folio);
@@ -403,9 +393,9 @@ static int memfd_luo_retrieve_folios(struct file *file,
 			goto unlock_folio;
 		}
 
-		if (flags & PRESERVED_FLAG_UPTODATE)
+		if (flags & MEMFD_LUO_FOLIO_UPTODATE)
 			folio_mark_uptodate(folio);
-		if (flags & PRESERVED_FLAG_DIRTY)
+		if (flags & MEMFD_LUO_FOLIO_DIRTY)
 			folio_mark_dirty(folio);
 
 		err = shmem_inode_acct_blocks(inode, 1);
@@ -435,7 +425,7 @@ put_folios:
 	for (; i < nr_folios; i++) {
 		const struct memfd_luo_folio_ser *pfolio = &folios_ser[i];
 
-		folio = kho_restore_folio(PRESERVED_FOLIO_PFN(pfolio->foliodesc));
+		folio = kho_restore_folio(pfolio->pfn);
 		if (folio)
 			folio_put(folio);
 	}
