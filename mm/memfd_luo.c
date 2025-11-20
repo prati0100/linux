@@ -478,6 +478,7 @@ static int memfd_luo_retrieve(struct liveupdate_file_op_args *args)
 	}
 
 	args->file = file;
+	kho_restore_free(ser);
 
 	return 0;
 
