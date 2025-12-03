@@ -153,8 +153,10 @@ static int hugetlbfs_file_mmap(struct file *file, struct vm_area_struct *vma)
 	if (hugetlb_reserve_pages(inode,
 				vma->vm_pgoff >> huge_page_order(h),
 				len >> huge_page_shift(h), vma,
-				vm_flags) < 0)
+				  vm_flags) < 0) {
+		printk("mmap: failed to reserve pages\n");
 		goto out;
+	}
 
 	ret = 0;
 	if (vma->vm_flags & VM_WRITE && inode->i_size < len)

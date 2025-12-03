@@ -214,6 +214,8 @@ struct liveupdate_flb {
 
 #ifdef CONFIG_LIVEUPDATE
 
+void __init liveupdate_early_init(void);
+
 /* Return true if live update orchestrator is enabled */
 bool liveupdate_enabled(void);
 
@@ -230,8 +232,13 @@ int liveupdate_unregister_flb(struct liveupdate_file_handler *fh,
 
 int liveupdate_flb_get_incoming(struct liveupdate_flb *flb, void **objp);
 int liveupdate_flb_get_outgoing(struct liveupdate_flb *flb, void **objp);
+u64 __init liveupdate_flb_incoming_early(const char *name);
 
 #else /* CONFIG_LIVEUPDATE */
+
+static inline void liveupdate_early_init(void)
+{
+}
 
 static inline bool liveupdate_enabled(void)
 {
@@ -275,6 +282,11 @@ static inline int liveupdate_flb_get_outgoing(struct liveupdate_flb *flb,
 					      void **objp)
 {
 	return -EOPNOTSUPP;
+}
+
+static inline u64 liveupdate_flb_incoming_early(const char *compatible)
+{
+	return 0;
 }
 
 #endif /* CONFIG_LIVEUPDATE */

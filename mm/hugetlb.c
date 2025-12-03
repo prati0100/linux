@@ -39,6 +39,8 @@
 #include <linux/memory.h>
 #include <linux/mm_inline.h>
 #include <linux/padata.h>
+#include <linux/pgalloc.h>
+#include <linux/liveupdate.h>
 
 #include <asm/page.h>
 #include <asm/pgalloc.h>
@@ -50,10 +52,13 @@
 #include <linux/hugetlb_cgroup.h>
 #include <linux/node.h>
 #include <linux/page_owner.h>
+#include <linux/kho/abi/hugetlb.h>
 #include "internal.h"
 #include "hugetlb_vmemmap.h"
 #include "hugetlb_cma.h"
 #include <linux/page-isolation.h>
+
+#include "hugetlb_internal.h"
 
 int hugetlb_max_hstate __read_mostly;
 unsigned int default_hstate_idx;
@@ -733,9 +738,8 @@ out_of_memory:
  * fail; region_chg will always allocate at least 1 entry and a region_add for
  * 1 page will only require at most 1 entry.
  */
-static long region_add(struct resv_map *resv, long f, long t,
-		       long in_regions_needed, struct hstate *h,
-		       struct hugetlb_cgroup *h_cg)
+long region_add(struct resv_map *resv, long f, long t, long in_regions_needed,
+		struct hstate *h, struct hugetlb_cgroup *h_cg)
 {
 	long add = 0, actual_regions_needed = 0;
 
@@ -800,8 +804,7 @@ retry:
  * zero.  -ENOMEM is returned if a new file_region structure or cache entry
  * is needed and can not be allocated.
  */
-static long region_chg(struct resv_map *resv, long f, long t,
-		       long *out_regions_needed)
+long region_chg(struct resv_map *resv, long f, long t, long *out_regions_needed)
 {
 	long chg = 0;
 
@@ -1160,19 +1163,6 @@ void resv_map_release(struct kref *ref)
 	VM_BUG_ON(resv_map->adds_in_progress);
 
 	kfree(resv_map);
-}
-
-static inline struct resv_map *inode_resv_map(struct inode *inode)
-{
-	/*
-	 * At inode evict time, i_mapping may not point to the original
-	 * address space within the inode.  This original address space
-	 * contains the pointer to the resv_map.  So, always use the
-	 * address space embedded within the inode.
-	 * The VERY common case is inode->mapping == &inode->i_data but,
-	 * this may not be true for device special inodes.
-	 */
-	return (struct resv_map *)(&inode->i_data)->i_private_data;
 }
 
 static struct resv_map *vma_resv_map(struct vm_area_struct *vma)
@@ -1894,7 +1884,7 @@ static void account_new_hugetlb_folio(struct hstate *h, struct folio *folio)
 	h->nr_huge_pages_node[folio_nid(folio)]++;
 }
 
-static void init_new_hugetlb_folio(struct folio *folio)
+void init_new_hugetlb_folio(struct folio *folio)
 {
 	__folio_set_hugetlb(folio);
 	INIT_LIST_HEAD(&folio->lru);
@@ -2006,8 +1996,8 @@ static struct folio *alloc_fresh_hugetlb_folio(struct hstate *h,
 	return folio;
 }
 
-static void prep_and_add_allocated_folios(struct hstate *h,
-					struct list_head *folio_list)
+void prep_and_add_allocated_folios(struct hstate *h,
+				   struct list_head *folio_list)
 {
 	unsigned long flags;
 	struct folio *folio, *tmp_f;
@@ -2020,6 +2010,26 @@ static void prep_and_add_allocated_folios(struct hstate *h,
 	list_for_each_entry_safe(folio, tmp_f, folio_list, lru) {
 		account_new_hugetlb_folio(h, folio);
 		enqueue_hugetlb_folio(h, folio);
+	}
+	spin_unlock_irqrestore(&hugetlb_lock, flags);
+}
+
+/* TODO: Revisit whether we should do it this way? Or open-code it in
+ * hugetlb_luo.c? */
+void prep_and_add_busy_folios(struct hstate *h, struct list_head *folio_list)
+{
+	unsigned long flags;
+	struct folio *folio, *tmp_f;
+	/* Send list for bulk vmemmap optimization processing */
+	hugetlb_vmemmap_optimize_folios(h, folio_list);
+
+	spin_lock_irqsave(&hugetlb_lock, flags);
+	list_for_each_entry_safe(folio, tmp_f, folio_list, lru) {
+		account_new_hugetlb_folio(h, folio);
+		folio_ref_unfreeze(folio, 1);
+		folio_clear_hugetlb_freed(folio);
+		folio_set_hugetlb_luo(folio);
+		list_move(&folio->lru, &h->hugepage_activelist);
 	}
 	spin_unlock_irqrestore(&hugetlb_lock, flags);
 }
@@ -3638,6 +3648,41 @@ static unsigned long __init hugetlb_pages_alloc_boot(struct hstate *h)
 	return h->nr_huge_pages;
 }
 
+/* TODO: Move this to hugetlb_luo.c */
+static bool __init hstate_in_liveupdate(struct hstate *h)
+{
+	struct hugetlb_hstate_ser *hstate_ser = NULL;
+	struct hugetlb_ser *hugetlb_ser;
+	u64 data;
+
+	data = liveupdate_flb_incoming_early(HUGETLB_FLB_NAME);
+	if (!data) {
+		printk("Hugetlb not in liveupdate\n");
+		return false;
+	}
+
+	/* TODO: This parsing should be done from some proper helpers. Here only
+	 * for my testing */
+	hugetlb_ser = __va(data);
+
+	for (short i = 0; i < hugetlb_ser->nr_hstates; i++) {
+		if (hugetlb_ser->hstates[i].order == h->order) {
+			hstate_ser = &hugetlb_ser->hstates[i];
+			break;
+		}
+	}
+
+	if (!hstate_ser) {
+		printk("Hstate %ld MiB did not participate in liveupdate\n",
+		       huge_page_size(h) / SZ_1M);
+		return false;
+	} else {
+		printk("Hstate %ld MiB has %ld pages from liveupdate\n",
+		       huge_page_size(h) / SZ_1M, hstate_ser->nr_pages);
+		return true;
+	}
+}
+
 /*
  * NOTE: this routine is called in different contexts for gigantic and
  * non-gigantic pages.
@@ -3662,6 +3707,9 @@ static void __init hugetlb_hstate_alloc_pages(struct hstate *h)
 		pr_warn_once("HugeTLB: hugetlb_cma is enabled, skip boot time allocation\n");
 		return;
 	}
+
+	if (hstate_in_liveupdate(h))
+		return;
 
 	if (!h->max_huge_pages)
 		return;
@@ -4717,6 +4765,7 @@ static int __init hugetlb_init(void)
 	hugetlb_sysfs_init();
 	hugetlb_cgroup_file_init();
 	hugetlb_sysctl_init();
+	hugetlb_luo_init();
 
 #ifdef CONFIG_SMP
 	num_fault_mutexes = roundup_pow_of_two(8 * num_possible_cpus());

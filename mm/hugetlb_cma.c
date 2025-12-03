@@ -140,6 +140,12 @@ void __init hugetlb_cma_reserve(int order)
 	bool node_specific_cma_alloc = false;
 	int nid;
 
+	/* TODO: How should liveupdate handle CMA areas for hugetlb? Some pages
+	 * might come from CMA so there might not be enough space to get the
+	 * full area. Plus, this is before KHO memory is deserialized so the
+	 * allocations will only come from scratch anyway. Maybe more KHO init
+	 * before this? */
+
 	/*
 	 * HugeTLB CMA reservation is required for gigantic
 	 * huge pages which could not be allocated via the

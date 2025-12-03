@@ -1,0 +1,49 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+/*
+ * Copyright (C) 2025 Pratyush Yadav <pratyush@kernel.org>
+ */
+#ifndef __HUGETLB_INTERNAL_H
+#define __HUGETLB_INTERNAL_H
+
+#include <linux/mm.h>
+#include <linux/hugetlb.h>
+#include <linux/hugetlb_cgroup.h>
+#include <linux/list.h>
+#include <linux/liveupdate.h>
+
+/* TODO: Should rename these so they is more hugetlb-specific. Or maybe avoid
+ * exporting them at all if possible?
+ */
+void init_new_hugetlb_folio(struct folio *folio);
+void prep_and_add_allocated_folios(struct hstate *h, struct list_head *folio_list);
+void prep_and_add_busy_folios(struct hstate *h, struct list_head *folio_list);
+long hugetlb_reserve_preallocated(struct inode *inode, long from, long to);
+
+long region_chg(struct resv_map *resv, long f, long t, long *out_regions_needed);
+long region_add(struct resv_map *resv, long f, long t, long in_regions_needed,
+		struct hstate *h, struct hugetlb_cgroup *h_cg);
+
+static inline struct resv_map *inode_resv_map(struct inode *inode)
+{
+	/*
+	 * At inode evict time, i_mapping may not point to the original
+	 * address space within the inode.  This original address space
+	 * contains the pointer to the resv_map.  So, always use the
+	 * address space embedded within the inode.
+	 * The VERY common case is inode->mapping == &inode->i_data but,
+	 * this may not be true for device special inodes.
+	 */
+	return (struct resv_map *)(&inode->i_data)->i_private_data;
+}
+
+#ifdef CONFIG_LIVEUPDATE
+void __init hugetlb_luo_init(void);
+#else
+static inline __init void hugetlb_luo_init(void)
+{
+}
+#endif /* CONFIG_LIVEUPDATE */
+
+
+
+#endif /* __HUGETLB_INTERNAL_H */

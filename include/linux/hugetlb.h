@@ -581,6 +581,8 @@ hugetlb_get_unmapped_area(struct file *file, unsigned long addr,
  * HPG_vmemmap_optimized - Set when the vmemmap pages of the page are freed.
  * HPG_raw_hwp_unreliable - Set when the hugetlb page has a hwpoison sub-page
  *     that is not tracked by raw_hwp_page list.
+ * HPG_luo - Set when folio is part of a file managed by the Live Update
+ *	Orchestrator (LUO).
  */
 enum hugetlb_page_flags {
 	HPG_restore_reserve = 0,
@@ -590,6 +592,7 @@ enum hugetlb_page_flags {
 	HPG_vmemmap_optimized,
 	HPG_raw_hwp_unreliable,
 	HPG_cma,
+	HPG_luo,
 	__NR_HPAGEFLAGS,
 };
 
@@ -650,6 +653,7 @@ HPAGEFLAG(Freed, freed)
 HPAGEFLAG(VmemmapOptimized, vmemmap_optimized)
 HPAGEFLAG(RawHwpUnreliable, raw_hwp_unreliable)
 HPAGEFLAG(Cma, cma)
+HPAGEFLAG(Luo, luo)
 
 #ifdef CONFIG_HUGETLB_PAGE
 

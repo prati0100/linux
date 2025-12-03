@@ -69,6 +69,13 @@ static struct {
 	u64 liveupdate_num;
 } luo_global;
 
+static bool __luo_early_initialized __initdata;
+
+bool __init luo_early_initialized(void)
+{
+	return __luo_early_initialized;
+}
+
 static int __init early_liveupdate_param(char *buf)
 {
 	return kstrtobool(buf, &luo_global.enabled);
@@ -133,20 +140,36 @@ static int __init luo_early_startup(void)
 	return err;
 }
 
-static int __init liveupdate_early_init(void)
+/*
+ * This should only be called after KHO FDT is known. It gets the LUO subtree
+ * and does initial validation, making early boot read-only access possible.
+ */
+void __init liveupdate_early_init(void)
 {
 	int err;
+
+	/*
+	 * HugeTLB needs LUO to be initialized early in boot, before gigantic
+	 * hugepages are allocated. On x86, that happens in setup_arch(), but on
+	 * ARM64 (and other architectures) that happens in mm_core_init().
+	 *
+	 * Since the code in mm_core_init() is shared between all architectures,
+	 * this can lead to the init being called twice. Skip if initialization
+	 * was already done.
+	 */
+	if (__luo_early_initialized)
+		return;
 
 	err = luo_early_startup();
 	if (err) {
 		luo_global.enabled = false;
 		luo_restore_fail("The incoming tree failed to initialize properly [%pe], disabling live update\n",
 				 ERR_PTR(err));
+		return;
 	}
 
-	return err;
+	__luo_early_initialized = true;
 }
-early_initcall(liveupdate_early_init);
 
 /* Called during boot to create outgoing LUO fdt tree */
 static int __init luo_fdt_setup(void)
@@ -194,6 +217,20 @@ exit_free:
 static int __init luo_late_startup(void)
 {
 	int err;
+
+	/*
+	 * HACK: This is done because the early init is moved to setup_arch on
+	 * x86. So double-check if KHO init failed after that, for example when
+	 * parsing the bitmaps.
+	 *
+	 * Should maybe find a better way to do this.
+	 */
+	if (!kho_is_enabled()) {
+		if (liveupdate_enabled())
+			pr_warn("Disabling liveupdate because KHO is disabled\n");
+		luo_global.enabled = false;
+		return 0;
+	}
 
 	if (!liveupdate_enabled())
 		return 0;
