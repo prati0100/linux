@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  * Copyright (C) 2025 Amazon.com Inc. or its affiliates.
- * Pratyush Yadav <pratyush@kernel.org>
+ * Copyright (C) 2025 Pratyush Yadav <pratyush@kernel.org>
  */
 
 /* TODO: Docs */
@@ -335,7 +335,7 @@ static int huge_memfd_preserve(struct liveupdate_file_op_args *args)
 	memfd_ser = folio_address(folio);
 	inode_lock(inode);
 
-	/* TODO: Freeze inode */
+	hugetlb_i_freeze(inode, true);
 
 	memfd_ser->size = i_size_read(inode);
 	memfd_ser->pos = file->f_pos;
@@ -443,7 +443,6 @@ static struct folio *huge_memfd_retrieve_folio(struct hstate *h,
 	init_new_hugetlb_folio(folio);
 	/* TODO: Properly figure out freezing. */
 	folio_ref_freeze(folio, 1);
-	/* TODO: make sure this always holds. */
 	__folio_mark_uptodate(folio);
 
 	list_add(&folio->lru, &list);
@@ -572,7 +571,6 @@ static struct liveupdate_file_handler huge_memfd_handler = {
 
 void __init hugetlb_luo_init(void)
 {
-	void *obj;
 	int err;
 
 	if (!liveupdate_enabled())
@@ -590,18 +588,4 @@ void __init hugetlb_luo_init(void)
 		liveupdate_unregister_file_handler(&huge_memfd_handler);
 		return;
 	}
-
-	/*
-	 * Trigger the FLB retrieve now so that the hstates are deserialized and
-	 * free pages added to the pool. This is needed for non-LUO hugepage
-	 * files to work. Without this, they will not have any hugepages to
-	 * allocate from until the first hugetlb LUO file gets retrieved.
-	 *
-	 * If this fails, there is no real recovery. Live updated hugetlb files
-	 * will not be available, and possibly no huge pages at all.
-	 */
-	err = liveupdate_flb_get_incoming(&hugetlb_luo_flb, &obj);
-	if (err && err != -ENODATA && err != -ENOENT)
-		pr_warn("could not retrtieve FLB data: %pe. hugetlb in unknown state.\n",
-			ERR_PTR(err));
 }

@@ -3712,6 +3712,8 @@ static void __init hugetlb_hstate_alloc_pages(struct hstate *h)
 
 	/* below will do all node balanced alloc */
 	if (hstate_is_gigantic(h))
+		/* TODO: This will fail with liveupdate since it will try to
+		 * allocate from scratch memory. Fix that. */
 		allocated = hugetlb_gigantic_pages_alloc_boot(h, nr_alloc);
 	else
 		allocated = hugetlb_pages_alloc_boot(h, nr_alloc);
