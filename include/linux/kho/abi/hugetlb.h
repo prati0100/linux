@@ -24,18 +24,13 @@
 
 static_assert(HUGETLB_SER_MAX_HSTATES >= HUGE_MAX_HSTATE);
 
-struct hugetlb_folio_ser {
-	u64 pfn:52;
-	u64 free:1;
-	u64 reserved:11;
-};
-
+/* TODO: Use u64/u32/etc for members? Remember: update variable types in code
+ * as well then like loop counters. */
 struct hugetlb_hstate_ser {
+	/* Number of _preserved_ pages in the hstate. */
 	unsigned long nr_pages;
 	unsigned int order;
 	unsigned int __reserved;
-	/* TODO: Can I make better type system for kho vmalloc? */
-	struct kho_vmalloc folios;
 };
 
 struct hugetlb_ser {
@@ -48,6 +43,7 @@ static_assert(sizeof(struct hugetlb_ser) <= PAGE_SIZE);
 
 #define HUGETLB_FLB_NAME "hugetlb"
 
+/* TODO: Once hugetlb_folio_ser goes away, name this one to that? */
 struct huge_memfd_folio_ser {
 	u64 pfn:52;
 	u64 reserved:12;

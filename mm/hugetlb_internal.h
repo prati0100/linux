@@ -11,13 +11,14 @@
 #include <linux/list.h>
 #include <linux/liveupdate.h>
 
+/* TODO: Have these here on in include/linux/hugetlb.h? */
+
 /* TODO: Should rename these so they is more hugetlb-specific. Or maybe avoid
  * exporting them at all if possible?
  */
 void init_new_hugetlb_folio(struct folio *folio);
 void prep_and_add_allocated_folios(struct hstate *h, struct list_head *folio_list);
 void prep_and_add_busy_folios(struct hstate *h, struct list_head *folio_list);
-long hugetlb_reserve_preallocated(struct inode *inode, long from, long to);
 
 long region_chg(struct resv_map *resv, long f, long t, long *out_regions_needed);
 long region_add(struct resv_map *resv, long f, long t, long in_regions_needed,
@@ -38,9 +39,15 @@ static inline struct resv_map *inode_resv_map(struct inode *inode)
 
 #ifdef CONFIG_LIVEUPDATE
 void __init hugetlb_luo_init(void);
+unsigned long __init hstate_liveupdate_pages(struct hstate *h);
 #else
 static inline __init void hugetlb_luo_init(void)
 {
+}
+
+static inline unsigned long __init hstate_liveupdate_pages(struct hstata *h)
+{
+	return 0;
 }
 #endif /* CONFIG_LIVEUPDATE */
 

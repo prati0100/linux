@@ -25,9 +25,9 @@
 /* TODO: HugeTLB CMA support. */
 
 struct hugetlb_flb_obj {
-	struct hugetlb_folio_ser *folios[HUGETLB_SER_MAX_HSTATES];
-	/* Stores pointer to struct hugetlb_folio_ser for each preserved PFN. */
-	struct xarray pfn_to_ser;
+	/* Serializes access to ser and its hstates. */
+	spinlock_t lock;
+	struct hugetlb_ser *ser;
 };
 
 struct huge_memfd_private {
@@ -35,155 +35,31 @@ struct huge_memfd_private {
 	unsigned long nr_folios;
 };
 
-static void hugetlb_flb_unpreserve_folio(struct hugetlb_folio_ser *folio_ser,
-					 struct hugetlb_flb_obj *obj)
-{
-	struct folio *folio = pfn_folio(folio_ser->pfn);
-	void *entry;
-
-	kho_unpreserve_folio(folio);
-	entry = xa_erase(&obj->pfn_to_ser, folio_ser->pfn);
-	WARN_ON_ONCE(entry != folio_ser); /* TODO: Keep this? */
-}
-
-static int hugetlb_flb_preserve_folio(struct folio *folio,
-				      struct hugetlb_folio_ser *folio_ser,
-				      struct hugetlb_flb_obj *obj)
-{
-	unsigned long pfn = folio_pfn(folio);
-	int err;
-
-	err = kho_preserve_folio(folio);
-	if (err)
-		return err;
-
-	folio_ser->pfn = pfn;
-	/*
-	 * Mark all folios as free for now. When files are preserved, they will
-	 * unset it for their folios.
-	 */
-	folio_ser->free = 1;
-
-	/*
-	 * Keep track of the serialized state for each folio. This saves file
-	 * preservation callbacks from having to scan the whole list for each
-	 * and every folio they preserve.
-	 */
-	err = xa_err(xa_store(&obj->pfn_to_ser, pfn, folio_ser, GFP_KERNEL));
-	if (err) {
-		kho_unpreserve_folio(folio);
-		return err;
-	}
-
-	return 0;
-}
-
-static void hugetlb_flb_unpreserve_hstate(struct hugetlb_hstate_ser *hser,
-					  struct hugetlb_flb_obj *obj,
-					  struct hugetlb_folio_ser *folios_ser)
-{
-	for (long i = 0; i < hser->nr_pages; i++)
-		hugetlb_flb_unpreserve_folio(&folios_ser[i], obj);
-
-	kho_unpreserve_vmalloc(&hser->folios);
-	vfree(folios_ser);
-}
-
-static int hugetlb_flb_preserve_hstate(struct hstate *h,
-				       struct hugetlb_hstate_ser *hser,
-				       struct hugetlb_folio_ser **out_folios_ser,
-				       struct hugetlb_flb_obj *obj)
-{
-	struct hugetlb_folio_ser *folios_ser;
-	struct folio *folio;
-	long idx = 0;
-	int err;
-
-	hser->nr_pages = h->nr_huge_pages;
-	hser->order = h->order;
-
-	folios_ser = vcalloc(h->nr_huge_pages, sizeof(struct hugetlb_folio_ser));
-	if (!folios_ser)
-		return -ENOMEM;
-
-	list_for_each_entry(folio, &h->hugepage_activelist, lru) {
-
-		err = hugetlb_flb_preserve_folio(folio, &folios_ser[idx], obj);
-		if (err)
-			goto err_unpreserve;
-		idx++;
-	}
-
-	for (int i = 0; i < MAX_NUMNODES; ++i) {
-		list_for_each_entry(folio, &h->hugepage_freelists[i], lru) {
-			err = hugetlb_flb_preserve_folio(folio, &folios_ser[idx], obj);
-			if (err)
-				goto err_unpreserve;
-			idx++;
-		}
-	}
-
-	if (WARN_ON_ONCE(idx != h->nr_huge_pages)) {
-		err = -EINVAL;
-		goto err_unpreserve;
-	}
-
-	err = kho_preserve_vmalloc(folios_ser, &hser->folios);
-	if (err)
-		goto err_unpreserve;
-
-	*out_folios_ser = folios_ser;
-	return 0;
-
-err_unpreserve:
-	for (long i = 0; i < idx; i++)
-		hugetlb_flb_unpreserve_folio(&folios_ser[i], obj);
-
-	vfree(folios_ser);
-	return err;
-}
-
-/* TODO: Freeze hstates after this. */
 static int hugetlb_flb_preserve(struct liveupdate_flb_op_args *args)
 {
 	struct hugetlb_ser *hugetlb_ser;
-	struct hugetlb_flb_obj *obj;
 	unsigned short nr_hstates = 0;
-	struct folio *hugetlb_ser_folio;
+	struct hugetlb_flb_obj *obj;
 	struct hstate *h;
-	int err;
 
-	obj = kzalloc(sizeof(*obj), GFP_KERNEL);
+	obj = kmalloc(sizeof(*obj), GFP_KERNEL);
 	if (!obj)
 		return -ENOMEM;
 
-	xa_init(&obj->pfn_to_ser);
-
-	hugetlb_ser_folio = folio_alloc(GFP_KERNEL | __GFP_ZERO, 0);
-	if (!hugetlb_ser_folio) {
-		err = -ENOMEM;
-		goto err_free_obj;
+	hugetlb_ser = kho_alloc_preserve(sizeof(*hugetlb_ser));
+	if (!hugetlb_ser) {
+		kfree(obj);
+		return -ENOMEM;
 	}
 
-	err = kho_preserve_folio(hugetlb_ser_folio);
-	if (err)
-		goto err_free_hugetlb_ser;
-
-	hugetlb_ser = folio_address(hugetlb_ser_folio);
+	spin_lock_init(&obj->lock);
+	obj->ser = hugetlb_ser;
 
 	for_each_hstate(h) {
-		struct hugetlb_folio_ser *folios_ser;
+		struct hugetlb_hstate_ser *hser = &hugetlb_ser->hstates[nr_hstates];
 
-		/* No point in preserving a hstate with no pages. */
-		if (!h->nr_huge_pages)
-			continue;
-
-		err = hugetlb_flb_preserve_hstate(h, &hugetlb_ser->hstates[nr_hstates],
-						  &folios_ser, obj);
-		if (err)
-			goto err_unpreserve;
-
-		obj->folios[nr_hstates] = folios_ser;
+		hser->nr_pages = 0;
+		hser->order = h->order;
 		nr_hstates++;
 	}
 
@@ -193,122 +69,34 @@ static int hugetlb_flb_preserve(struct liveupdate_flb_op_args *args)
 	args->data = virt_to_phys(hugetlb_ser);
 
 	return 0;
-
-err_unpreserve:
-	for (short i = 0; i < nr_hstates; i++)
-		hugetlb_flb_unpreserve_hstate(&hugetlb_ser->hstates[i],
-					      obj, obj->folios[i]);
-	kho_unpreserve_folio(hugetlb_ser_folio);
-err_free_hugetlb_ser:
-	folio_put(hugetlb_ser_folio);
-err_free_obj:
-	kfree(obj);
-	return err;
 }
 
 static void hugetlb_flb_unpreserve(struct liveupdate_flb_op_args *args)
 {
-	struct hugetlb_ser *hugetlb_ser = phys_to_virt(args->data);
-	struct folio *folio = virt_to_folio(hugetlb_ser);
-	struct hugetlb_flb_obj *obj = args->obj;
-
-	for (short i = 0; i < hugetlb_ser->nr_hstates; i++)
-		hugetlb_flb_unpreserve_hstate(&hugetlb_ser->hstates[i], obj,
-					      obj->folios[i]);
-	kho_unpreserve_folio(folio);
-	folio_put(folio);
-	/* TODO: Put these assertions under debug config? */
-	WARN_ON_ONCE(!xa_empty(&obj->pfn_to_ser));
-	kfree(obj);
+	kho_unpreserve_free(phys_to_virt(args->data));
+	kfree(args->obj);
 }
 
 static void hugetlb_flb_finish(struct liveupdate_flb_op_args *args)
 {
-	/* No live state needed on the retrieve side. So nothing to do here. */
-}
-
-static int hugetlb_flb_retrieve_hstate(struct hugetlb_hstate_ser *hser)
-{
-	struct hstate *h = size_to_hstate(PAGE_SIZE << hser->order);
-	struct hugetlb_folio_ser *folios_ser;
-	LIST_HEAD(free_folios);
-	LIST_HEAD(busy_folios);
-
-	if (!h) {
-		pr_warn("no hstate found for order %u\n", hser->order);
-		return -EINVAL;
-	}
-
-	folios_ser = kho_restore_vmalloc(&hser->folios);
-	if (!folios_ser) {
-		pr_warn("failed to restore hstate order %u\n", hser->order);
-		/* TODO: These failures should either stop hugetlb
-		 * preservation completely or panic. */
-		return -EINVAL;
-	}
-
-	for (unsigned long f = 0; f < hser->nr_pages; f++) {
-		struct folio *folio;
-
-		/* TODO: Gigantic hugepages have different struct page
-		 * init style. See __alloc_bootmem_huge_page(). */
-		folio = kho_restore_folio(PFN_PHYS(folios_ser[f].pfn));
-		if (!folio) {
-			pr_warn("failed to restore folio for hstate order %d\n",
-				hser->order);
-			return -EINVAL;
-		}
-		init_new_hugetlb_folio(folio);
-		/* TODO: Properly figure out freezing. */
-		folio_ref_freeze(folio, 1);
-		if (folios_ser[f].free)
-			list_add(&folio->lru, &free_folios);
-		else
-			list_add(&folio->lru, &busy_folios);
-	}
-
-	/* TODO: Should I use add_hugetlb_folio() instead? */
-	prep_and_add_allocated_folios(h, &free_folios);
-	prep_and_add_busy_folios(h, &busy_folios);
-
-	vfree(folios_ser);
-
-	return 0;
+	/* No live state on the retrieve side. */
 }
 
 static int hugetlb_flb_retrieve(struct liveupdate_flb_op_args *args)
 {
-	struct hugetlb_ser *hugetlb_ser;
-	struct folio *hugetlb_ser_folio;
-	int err = 0;
-
-	hugetlb_ser_folio = kho_restore_folio(args->data);
-	if (!hugetlb_ser_folio)
-		return -EINVAL;
-
-	hugetlb_ser = folio_address(hugetlb_ser_folio);
-
-	for (short i = 0; i < hugetlb_ser->nr_hstates; i++) {
-		err = hugetlb_flb_retrieve_hstate(&hugetlb_ser->hstates[i]);
-		/*
-		 * If tihs fails, stop trying to retrieve other hstates, since
-		 * something has really gone wrong and the system can be in a
-		 * bad state. But keep the ones already reteieved around.
-		 */
-		/* TODO: Make sure retrieve of files of failed hstates also fails. */
-		if (err)
-			goto out;
-	}
+	/*
+	 * The FLB is only needed for boot-time calculation of how many
+	 * hugepages are needed. This is done by early boot handlers already.
+	 * Free the serialized state now.
+	 */
+	kho_restore_free(phys_to_virt(args->data));
 
 	/*
-	 * HACK: LUO FLB needs an object or it will retry the retrieve. But
-	 * there is not a real need for any live state after retrieve. So just
-	 * use ZERO_SIZE_PTR to satisfy FLB.
+	 * HACK: But since LUO FLB still needs an obj, use ZERO_SIZE_PTR to
+	 * satisfy it.
 	 */
 	args->obj = ZERO_SIZE_PTR;
-out:
-	folio_put(hugetlb_ser_folio);
-	return err;
+	return 0;
 }
 
 static struct liveupdate_flb_ops hugetlb_luo_flb_ops = {
@@ -323,29 +111,76 @@ static struct liveupdate_flb hugetlb_luo_flb = {
 	.compatible = "hugetlb",
 };
 
-/*
- * Initially, all folios are marked as free in the serialized data. File
- * preservation callbacks should call this on each folio in the preserved file
- * so it gets marked as not free and is not released to the allocator after live
- * update.
- */
-static int hugetlb_flb_mark_busy(struct folio *folio)
+static struct hugetlb_hstate_ser
+*hugetlb_flb_get_hser(struct hugetlb_ser *hugetlb_ser, unsigned short order)
 {
+	for (unsigned short i = 0; i < hugetlb_ser->nr_hstates; i++) {
+		if (hugetlb_ser->hstates[i].order == order)
+			return &hugetlb_ser->hstates[i];
+	}
+
+	return NULL;
+}
+
+static int hugetlb_flb_add_folio(struct hstate *h)
+{
+	struct hugetlb_ser *hugetlb_ser;
+	struct hugetlb_hstate_ser *hser;
 	struct hugetlb_flb_obj *obj;
-	struct hugetlb_folio_ser *folio_ser;
 	int err;
 
 	err = liveupdate_flb_get_outgoing(&hugetlb_luo_flb, (void **)&obj);
 	if (err)
 		return err;
 
-	folio_ser = xa_load(&obj->pfn_to_ser, folio_pfn(folio));
-	if (xa_is_err(folio_ser))
-		return xa_err(folio_ser);
+	hugetlb_ser = obj->ser;
 
-	folio_ser->free = 0;
+	guard(spinlock)(&obj->lock);
+	hser = hugetlb_flb_get_hser(hugetlb_ser, h->order);
+	if (!hser)
+		return -ENOENT;
 
+	hser->nr_pages++;
 	return 0;
+}
+
+static int hugetlb_flb_del_folio(struct hstate *h)
+{
+	struct hugetlb_ser *hugetlb_ser;
+	struct hugetlb_hstate_ser *hser;
+	struct hugetlb_flb_obj *obj;
+	int err;
+
+	err = liveupdate_flb_get_outgoing(&hugetlb_luo_flb, (void **)&obj);
+	if (err)
+		return err;
+
+	hugetlb_ser = obj->ser;
+
+	guard(spinlock)(&obj->lock);
+	hser = hugetlb_flb_get_hser(hugetlb_ser, h->order);
+	if (!hser)
+		return -ENOENT;
+
+	hser->nr_pages--;
+	return 0;
+}
+
+unsigned long __init hstate_liveupdate_pages(struct hstate *h)
+{
+	struct hugetlb_hstate_ser *hser;
+	struct hugetlb_ser *hugetlb_ser;
+	u64 data;
+
+	data = liveupdate_flb_incoming_early(HUGETLB_FLB_NAME);
+	if (!data)
+		return 0;
+
+	hugetlb_ser = phys_to_virt(data);
+
+	/* NOTE: No need for locking since this is read-only on incoming side. */
+	hser = hugetlb_flb_get_hser(hugetlb_ser, h->order);
+	return hser ? hser->nr_pages : 0;
 }
 
 static bool huge_memfd_can_preserve(struct liveupdate_file_handler *handler,
@@ -354,6 +189,37 @@ static bool huge_memfd_can_preserve(struct liveupdate_file_handler *handler,
 	struct inode *inode = file_inode(file);
 
 	return is_file_hugepages(file) && !inode->i_nlink;
+}
+
+static void huge_memfd_unpreserve_folio(struct hstate *h, struct folio *folio)
+{
+	hugetlb_flb_del_folio(h);
+	kho_unpreserve_folio(folio);
+}
+
+static int huge_memfd_preserve_folio(struct hstate *h, struct folio *folio,
+				     struct huge_memfd_folio_ser *folio_ser)
+{
+	int err;
+
+	err = kho_preserve_folio(folio);
+	if (err)
+		return err;
+
+	err = hugetlb_flb_add_folio(h);
+	if (err)
+		goto err_unpreserve;
+
+	folio_ser->pfn = folio_pfn(folio);
+	folio_ser->index = folio->index;
+
+	printk("preserving pfn: 0x%lx index: 0x%lx\n",
+	       (unsigned long)folio_ser->pfn, (unsigned long)folio_ser->index);
+	return 0;
+
+err_unpreserve:
+	kho_unpreserve_folio(folio);
+	return err;
 }
 
 static int
@@ -415,25 +281,9 @@ huge_memfd_preserve_folios(struct huge_memfd_ser *memfd_ser, struct file *file,
 	for (i = 0; i < nr_folios; i++) {
 		/* TODO: The naming of folios_ser and folio_ser is very easy to
 		 * mix up. */
-		struct huge_memfd_folio_ser *folio_ser = &folios_ser[i];
-		struct folio *folio = folios[i];
-
-		/*
-		 * The folio should already have been KHO-preserved by FLB. Just
-		 * mark it as busy now.
-		 */
-		err = hugetlb_flb_mark_busy(folio);
+		err = huge_memfd_preserve_folio(h, folios[i], &folios_ser[i]);
 		if (err)
 			goto err_unpreserve;
-
-		folio_set_hugetlb_luo(folio);
-
-		folio_ser->pfn = folio_pfn(folio);
-		folio_ser->index = folio->index;
-
-		printk("preserving pfn: 0x%lx index: 0x%lx\n",
-		       (unsigned long)folio_ser->pfn,
-		       (unsigned long)folio_ser->index);
 	}
 
 	err = kho_preserve_vmalloc(folios_ser, &memfd_ser->folios);
@@ -447,7 +297,7 @@ huge_memfd_preserve_folios(struct huge_memfd_ser *memfd_ser, struct file *file,
 
 err_unpreserve:
 	for (i = i - 1; i >= 0; i--)
-		kho_unpreserve_folio(folios[i]);
+		huge_memfd_unpreserve_folio(h, folios[i]);
 	vfree(folios_ser);
 err_unpin:
 	unpin_folios(folios, nr_folios);
@@ -577,13 +427,39 @@ err_todo:
 	return -EINVAL;
 }
 
+static struct folio *huge_memfd_retrieve_folio(struct hstate *h,
+					       struct huge_memfd_folio_ser *folio_ser)
+{
+	struct folio *folio;
+	LIST_HEAD(list);
+
+	printk("restoring pfn: 0x%lx index: 0x%lx\n",
+	       (unsigned long)folio_ser->pfn, (unsigned long)folio_ser->index);
+
+	folio = kho_restore_folio(PFN_PHYS(folio_ser->pfn));
+	if (!folio)
+		return NULL;
+
+	init_new_hugetlb_folio(folio);
+	/* TODO: Properly figure out freezing. */
+	folio_ref_freeze(folio, 1);
+	/* TODO: make sure this always holds. */
+	__folio_mark_uptodate(folio);
+
+	list_add(&folio->lru, &list);
+	/* TODO: Do this in bulk for all the folios in the file? */
+	prep_and_add_busy_folios(h, &list);
+
+	return folio;
+}
+
 static int huge_memfd_retrieve_folios(struct file *file,
 				      struct huge_memfd_ser *memfd_ser)
 {
 	struct huge_memfd_folio_ser *folios_ser;
 	struct inode *inode = file_inode(file);
+	struct hstate *h = hstate_inode(inode);
 	struct address_space *mapping;
-	struct folio *folio;
 	unsigned long nr_folios;
 	long i = 0;
 	int err;
@@ -602,29 +478,14 @@ static int huge_memfd_retrieve_folios(struct file *file,
 
 	for (i = 0; i < nr_folios; i++) {
 		struct huge_memfd_folio_ser *folio_ser = &folios_ser[i];
+		struct folio *folio;
 
-		printk("restoring pfn: 0x%lx index: 0x%lx\n",
-		       (unsigned long)folio_ser->pfn,
-		       (unsigned long)folio_ser->index);
-
-		/*
-		 * FLB already restored and prepped the folio, but double-check
-		 * first.
-		 */
-		folio = pfn_folio(folio_ser->pfn);
-		if (!folio_test_hugetlb_luo(folio)) {
+		folio = huge_memfd_retrieve_folio(h, folio_ser);
+		if (!folio) {
 			err = -EINVAL;
-			folio_put(folio);
-			printk("folio not hugetlb!\n");
 			goto err_restore_folios;
 		}
 
-		folio_clear_hugetlb_luo(folio);
-		/* TODO: make sure this always holds. */
-		__folio_mark_uptodate(folio);
-		/* TODO: If we are having to shift by order here, maybe just
-		 * save the huge-size index instead of page cache index when
-		 * preserving? */
 		err = hugetlb_add_to_page_cache(folio, mapping,
 						folio_ser->index >> memfd_ser->order);
 		if (err) {
@@ -694,6 +555,7 @@ err_put_folio:
 	return err;
 }
 
+/* TODO: Use hugemfd as prefix to name names shorter? */
 static const struct liveupdate_file_ops huge_memfd_luo_ops = {
 	.can_preserve = huge_memfd_can_preserve,
 	.preserve = huge_memfd_preserve,
@@ -739,6 +601,7 @@ void __init hugetlb_luo_init(void)
 	 * will not be available, and possibly no huge pages at all.
 	 */
 	err = liveupdate_flb_get_incoming(&hugetlb_luo_flb, &obj);
-	if (err != -ENODATA && err != -ENOENT)
-		pr_warn("could not retrtieve FLB data. hugetlb in unknown state.\n");
+	if (err && err != -ENODATA && err != -ENOENT)
+		pr_warn("could not retrtieve FLB data: %pe. hugetlb in unknown state.\n",
+			ERR_PTR(err));
 }
