@@ -16,11 +16,13 @@
 #include <linux/shmem_fs.h>
 #include <linux/bits.h>
 #include <linux/hugetlb.h>
+#include <linux/hugetlb_cgroup.h>
 #include <linux/vmalloc.h>
 #include <linux/kho/abi/hugetlb.h>
 
 #include "internal.h"
 #include "hugetlb_internal.h"
+#include "hugetlb_vmemmap.h"
 
 /* TODO: HugeTLB CMA support. */
 
@@ -462,26 +464,34 @@ err_todo:
 	return -EINVAL;
 }
 
-static struct folio *huge_memfd_retrieve_folio(struct hstate *h,
-					       struct huge_memfd_folio_ser *folio_ser)
+static struct folio *huge_memfd_retrieve_folio(struct huge_memfd_folio_ser *folio_ser)
 {
 	struct folio *folio;
-	LIST_HEAD(list);
 
 	folio = kho_restore_folio(PFN_PHYS(folio_ser->pfn));
 	if (!folio)
 		return NULL;
 
 	init_new_hugetlb_folio(folio);
-	/* TODO: Properly figure out freezing. */
-	folio_ref_freeze(folio, 1);
 	__folio_mark_uptodate(folio);
-
-	list_add(&folio->lru, &list);
-	/* TODO: Do this in bulk for all the folios in the file? */
-	prep_and_add_busy_folios(h, &list);
-
 	return folio;
+}
+
+static void huge_memfd_add_folios(struct hstate *h, struct list_head *folio_list)
+{
+	unsigned long flags;
+	struct folio *folio, *tmp_f;
+
+	/* Send list for bulk vmemmap optimization processing */
+	hugetlb_vmemmap_optimize_folios(h, folio_list);
+
+	spin_lock_irqsave(&hugetlb_lock, flags);
+	list_for_each_entry_safe(folio, tmp_f, folio_list, lru) {
+		account_new_hugetlb_folio(h, folio);
+		folio_clear_hugetlb_freed(folio);
+		list_move(&folio->lru, &h->hugepage_activelist);
+	}
+	spin_unlock_irqrestore(&hugetlb_lock, flags);
 }
 
 static int huge_memfd_retrieve_folios(struct file *file,
@@ -490,10 +500,13 @@ static int huge_memfd_retrieve_folios(struct file *file,
 	struct huge_memfd_folio_ser *folios_ser;
 	struct inode *inode = file_inode(file);
 	struct hstate *h = hstate_inode(inode);
+	int err, hidx = hstate_index(h);
+	gfp_t gfp = htlb_alloc_mask(h) | __GFP_RETRY_MAYFAIL;
 	struct address_space *mapping;
+	struct hugetlb_cgroup *h_cg;
 	unsigned long nr_folios;
+	LIST_HEAD(list);
 	long i = 0;
-	int err;
 
 	if (!memfd_ser->size)
 		return 0;
@@ -505,24 +518,54 @@ static int huge_memfd_retrieve_folios(struct file *file,
 	nr_folios = memfd_ser->nr_folios;
 	mapping = inode->i_mapping;
 
+	/* First prepare the folios and add them to the hstate. */
 	for (i = 0; i < nr_folios; i++) {
 		struct huge_memfd_folio_ser *folio_ser = &folios_ser[i];
 		struct folio *folio;
 
-		folio = huge_memfd_retrieve_folio(h, folio_ser);
+		folio = huge_memfd_retrieve_folio(folio_ser);
 		if (!folio) {
 			err = -EINVAL;
 			goto err_restore_folios;
 		}
 
+		list_add(&folio->lru, &list);
+	}
+
+	huge_memfd_add_folios(h, &list);
+
+	/* Now that all the folios are prepared, add them to the file. */
+	for (i = 0; i < nr_folios; i++) {
+		struct folio *folio = pfn_folio(folios_ser[i].pfn);
+
 		err = hugetlb_add_to_page_cache(folio, mapping,
-						folio_ser->index >> memfd_ser->order);
+						folios_ser[i].index >> memfd_ser->order);
 		if (err) {
 			pr_err("failed to add to page cache: %pe\n", ERR_PTR(err));
 			folio_put(folio);
 			goto err_restore_folios;
 		}
-		/* TODO: charge the cgroup. */
+
+		spin_lock_irq(&hugetlb_lock);
+		/* TODO: Revisit cgroup charging. */
+		err = hugetlb_cgroup_charge_cgroup(hidx, pages_per_huge_page(h),
+						   &h_cg);
+		if (err) {
+			spin_unlock_irq(&hugetlb_lock);
+			goto err_todo;
+		}
+
+		hugetlb_cgroup_commit_charge(hidx, pages_per_huge_page(h), h_cg, folio);
+		/* TODO: Should we commit the cgroup charge here? How does this
+		 * commit system even work? */
+		hugetlb_cgroup_commit_charge_rsvd(hidx, pages_per_huge_page(h),
+						  h_cg, folio);
+		spin_unlock_irq(&hugetlb_lock);
+
+		err = mem_cgroup_charge_hugetlb(folio, gfp);
+		if (err)
+			goto err_todo;
+
 		folio_unlock(folio);
 		folio_put(folio);
 	}
@@ -530,6 +573,7 @@ static int huge_memfd_retrieve_folios(struct file *file,
 	vfree(folios_ser);
 	return 0;
 
+err_todo:
 	/* TODO: Revisit. Make sure error handling is done right. */
 err_restore_folios:
 	/* TODO: Free the other folios of this file. */

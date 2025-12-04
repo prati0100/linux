@@ -1878,7 +1878,7 @@ void free_huge_folio(struct folio *folio)
 /*
  * Must be called with the hugetlb lock held
  */
-static void account_new_hugetlb_folio(struct hstate *h, struct folio *folio)
+void account_new_hugetlb_folio(struct hstate *h, struct folio *folio)
 {
 	lockdep_assert_held(&hugetlb_lock);
 	h->nr_huge_pages++;
@@ -1997,8 +1997,8 @@ static struct folio *alloc_fresh_hugetlb_folio(struct hstate *h,
 	return folio;
 }
 
-void prep_and_add_allocated_folios(struct hstate *h,
-				   struct list_head *folio_list)
+static void prep_and_add_allocated_folios(struct hstate *h,
+					  struct list_head *folio_list)
 {
 	unsigned long flags;
 	struct folio *folio, *tmp_f;
@@ -2011,26 +2011,6 @@ void prep_and_add_allocated_folios(struct hstate *h,
 	list_for_each_entry_safe(folio, tmp_f, folio_list, lru) {
 		account_new_hugetlb_folio(h, folio);
 		enqueue_hugetlb_folio(h, folio);
-	}
-	spin_unlock_irqrestore(&hugetlb_lock, flags);
-}
-
-/* TODO: Revisit whether we should do it this way? Or open-code it in
- * hugetlb_luo.c? */
-void prep_and_add_busy_folios(struct hstate *h, struct list_head *folio_list)
-{
-	unsigned long flags;
-	struct folio *folio, *tmp_f;
-	/* Send list for bulk vmemmap optimization processing */
-	hugetlb_vmemmap_optimize_folios(h, folio_list);
-
-	spin_lock_irqsave(&hugetlb_lock, flags);
-	list_for_each_entry_safe(folio, tmp_f, folio_list, lru) {
-		account_new_hugetlb_folio(h, folio);
-		folio_ref_unfreeze(folio, 1);
-		folio_clear_hugetlb_freed(folio);
-		folio_set_hugetlb_luo(folio);
-		list_move(&folio->lru, &h->hugepage_activelist);
 	}
 	spin_unlock_irqrestore(&hugetlb_lock, flags);
 }

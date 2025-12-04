@@ -17,8 +17,7 @@
  * exporting them at all if possible?
  */
 void init_new_hugetlb_folio(struct folio *folio);
-void prep_and_add_allocated_folios(struct hstate *h, struct list_head *folio_list);
-void prep_and_add_busy_folios(struct hstate *h, struct list_head *folio_list);
+void account_new_hugetlb_folio(struct hstate *h, struct folio *folio);
 
 long region_chg(struct resv_map *resv, long f, long t, long *out_regions_needed);
 long region_add(struct resv_map *resv, long f, long t, long in_regions_needed,
