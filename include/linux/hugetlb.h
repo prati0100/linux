@@ -510,6 +510,7 @@ static inline struct hugetlbfs_sb_info *HUGETLBFS_SB(struct super_block *sb)
 
 struct hugetlbfs_inode_info {
 	struct inode vfs_inode;
+	/* TODO: Make seals short so frozen flag doesn't add space? */
 	unsigned int seals;
 	bool frozen;
 };

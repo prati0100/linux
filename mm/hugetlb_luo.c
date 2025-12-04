@@ -212,9 +212,6 @@ static int huge_memfd_preserve_folio(struct hstate *h, struct folio *folio,
 
 	folio_ser->pfn = folio_pfn(folio);
 	folio_ser->index = folio->index;
-
-	printk("preserving pfn: 0x%lx index: 0x%lx\n",
-	       (unsigned long)folio_ser->pfn, (unsigned long)folio_ser->index);
 	return 0;
 
 err_unpreserve:
@@ -269,9 +266,6 @@ huge_memfd_preserve_folios(struct huge_memfd_ser *memfd_ser, struct file *file,
 		goto err_free_folios;
 	}
 
-	/* HACK */
-	WARN_ON_ONCE(nr_folios != max_folios);
-
 	folios_ser = vcalloc(nr_folios, sizeof(*folios_ser));
 	if (!folios_ser) {
 		err = -ENOMEM;
@@ -279,8 +273,6 @@ huge_memfd_preserve_folios(struct huge_memfd_ser *memfd_ser, struct file *file,
 	}
 
 	for (i = 0; i < nr_folios; i++) {
-		/* TODO: The naming of folios_ser and folio_ser is very easy to
-		 * mix up. */
 		err = huge_memfd_preserve_folio(h, folios[i], &folios_ser[i]);
 		if (err)
 			goto err_unpreserve;
@@ -289,6 +281,8 @@ huge_memfd_preserve_folios(struct huge_memfd_ser *memfd_ser, struct file *file,
 	err = kho_preserve_vmalloc(folios_ser, &memfd_ser->folios);
 	if (err)
 		goto err_unpreserve;
+
+	kvfree(folios);
 
 	memfd_ser->nr_folios = nr_folios;
 	*nr_foliosp = nr_folios;
@@ -314,7 +308,6 @@ static int huge_memfd_preserve(struct liveupdate_file_op_args *args)
 	struct huge_memfd_folio_ser *folios_ser;
 	struct huge_memfd_private *private;
 	struct huge_memfd_ser *memfd_ser;
-	struct folio *folio;
 	unsigned long nr_folios;
 	int err;
 
@@ -322,17 +315,12 @@ static int huge_memfd_preserve(struct liveupdate_file_op_args *args)
 	if (!private)
 		return -ENOMEM;
 
-	folio = folio_alloc(GFP_KERNEL | __GFP_ZERO, 0);
-	if (!folio) {
+	memfd_ser = kho_alloc_preserve(sizeof(*memfd_ser));
+	if (!memfd_ser) {
 		err = -ENOMEM;
 		goto err_free_private;
 	}
 
-	err = kho_preserve_folio(folio);
-	if (err)
-		goto err_put_folio;
-
-	memfd_ser = folio_address(folio);
 	inode_lock(inode);
 
 	hugetlb_i_freeze(inode, true);
@@ -359,21 +347,70 @@ static int huge_memfd_preserve(struct liveupdate_file_op_args *args)
 
 err_unlock:
 	inode_unlock(inode);
-err_put_folio:
-	folio_put(folio);
+	kho_unpreserve_free(memfd_ser);
 err_free_private:
 	kfree(private);
 	return err;
 }
 
+static void huge_memfd_unpreserve_folios(struct huge_memfd_ser *memfd_ser,
+					 struct huge_memfd_folio_ser *folios_ser,
+					 unsigned long nr_folios,
+					 struct hstate *h)
+{
+	if (!nr_folios)
+		return;
+
+	kho_unpreserve_vmalloc(&memfd_ser->folios);
+
+	for (long i = 0; i < nr_folios; i++) {
+		struct folio *folio = pfn_folio(folios_ser[i].pfn);
+
+		huge_memfd_unpreserve_folio(h, folio);
+		unpin_folio(folio);
+	}
+
+	vfree(folios_ser);
+}
+
 static void huge_memfd_unpreserve(struct liveupdate_file_op_args *args)
 {
+	struct huge_memfd_ser *memfd_ser = phys_to_virt(args->serialized_data);
+	struct huge_memfd_private *private = args->private_data;
+	struct inode *inode = file_inode(args->file);
+	struct hstate *h = hstate_inode(inode);
 
+	inode_lock(inode);
+	huge_memfd_unpreserve_folios(memfd_ser, private->folios_ser,
+				     private->nr_folios, h);
+	hugetlb_i_freeze(inode, false);
+	kho_unpreserve_free(memfd_ser);
+	kfree(private);
+	inode_unlock(inode);
+}
+
+static int huge_memfd_freeze(struct liveupdate_file_op_args *args)
+{
+	struct huge_memfd_ser *memfd_ser = phys_to_virt(args->serialized_data);
+
+	/*
+	 * The pos might have changed since prepare. Everything else stays the
+	 * same.
+	 */
+	memfd_ser->pos = args->file->f_pos;
+	return 0;
 }
 
 static void huge_memfd_finish(struct liveupdate_file_op_args *args)
 {
+	struct huge_memfd_ser *memfd_ser = phys_to_virt(args->serialized_data);
 
+	if (args->retrieved)
+		return;
+
+	if (memfd_ser->nr_folios) {
+		/* TODO: Add the folios back in hstate. */
+	}
 }
 
 static int huge_memfd_setup_rsrv(struct inode *inode)
@@ -391,7 +428,6 @@ static int huge_memfd_setup_rsrv(struct inode *inode)
 
 	resv_map = inode_resv_map(inode);
 	chg = region_chg(resv_map, from, to, &regions_needed);
-	printk("chg: %ld regions needed: %ld\n", chg, regions_needed);
 	if (chg < 0)
 		return chg;
 
@@ -414,7 +450,6 @@ static int huge_memfd_setup_rsrv(struct inode *inode)
 	 * the internal mounts of hugetlbfs and that doesn't have subpools.
 	 */
 	add = region_add(resv_map, from, to, regions_needed, h, h_cg);
-	printk("added: %ld\n", add);
 	if (add < 0)
 		goto err_todo;
 
@@ -432,9 +467,6 @@ static struct folio *huge_memfd_retrieve_folio(struct hstate *h,
 {
 	struct folio *folio;
 	LIST_HEAD(list);
-
-	printk("restoring pfn: 0x%lx index: 0x%lx\n",
-	       (unsigned long)folio_ser->pfn, (unsigned long)folio_ser->index);
 
 	folio = kho_restore_folio(PFN_PHYS(folio_ser->pfn));
 	if (!folio)
@@ -466,8 +498,6 @@ static int huge_memfd_retrieve_folios(struct file *file,
 	if (!memfd_ser->size)
 		return 0;
 
-	printk("order: %d\n", memfd_ser->order);
-
 	folios_ser = kho_restore_vmalloc(&memfd_ser->folios);
 	if (!folios_ser)
 		return -ENOMEM;
@@ -488,7 +518,7 @@ static int huge_memfd_retrieve_folios(struct file *file,
 		err = hugetlb_add_to_page_cache(folio, mapping,
 						folio_ser->index >> memfd_ser->order);
 		if (err) {
-			printk("Failed to add to page cache: %pe\n", ERR_PTR(err));
+			pr_err("failed to add to page cache: %pe\n", ERR_PTR(err));
 			folio_put(folio);
 			goto err_restore_folios;
 		}
@@ -514,8 +544,6 @@ static int huge_memfd_retrieve(struct liveupdate_file_op_args *args)
 	struct folio *folio;
 	struct file *file;
 	int err;
-
-	printk("In %s\n", __func__);
 
 	folio = kho_restore_folio(args->serialized_data);
 	if (!folio)
@@ -559,6 +587,7 @@ static const struct liveupdate_file_ops huge_memfd_luo_ops = {
 	.can_preserve = huge_memfd_can_preserve,
 	.preserve = huge_memfd_preserve,
 	.unpreserve = huge_memfd_unpreserve,
+	.freeze = huge_memfd_freeze,
 	.finish = huge_memfd_finish,
 	.retrieve = huge_memfd_retrieve,
 	.owner = THIS_MODULE,
