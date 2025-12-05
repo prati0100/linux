@@ -10,7 +10,6 @@
 #include <linux/hugetlb.h>
 #include <linux/kexec_handover.h>
 
-/* TODO: Versioning */
 /* TODO: Documentation */
 
 /*
@@ -31,26 +30,22 @@ struct hugetlb_hstate_ser {
 	unsigned long nr_pages;
 	unsigned int order;
 	unsigned int __reserved;
-};
+} __packed;
 
 struct hugetlb_ser {
-	unsigned short nr_hstates;
-	/* TODO: take care of padding? */
 	struct hugetlb_hstate_ser hstates[HUGETLB_SER_MAX_HSTATES];
-};
+	unsigned short nr_hstates;
+} __packed;
 
 static_assert(sizeof(struct hugetlb_ser) <= PAGE_SIZE);
 
-#define HUGETLB_FLB_NAME "hugetlb"
+#define HUGETLB_FLB_NAME "hugetlb-v1"
 
-/* TODO: Once hugetlb_folio_ser goes away, name this one to that? */
 struct huge_memfd_folio_ser {
 	u64 pfn:52;
 	u64 reserved:12;
-	/* TODO: Do we even need index? Or can we assume that from the position
-	 * in array? */
 	u64 index;
-};
+} __packed;
 
 struct huge_memfd_ser {
 	unsigned long size;

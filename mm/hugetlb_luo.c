@@ -9,18 +9,13 @@
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/file.h>
-#include <linux/io.h>
-#include <linux/libfdt.h>
 #include <linux/liveupdate.h>
 #include <linux/kexec_handover.h>
-#include <linux/shmem_fs.h>
-#include <linux/bits.h>
 #include <linux/hugetlb.h>
 #include <linux/hugetlb_cgroup.h>
 #include <linux/vmalloc.h>
 #include <linux/kho/abi/hugetlb.h>
 
-#include "internal.h"
 #include "hugetlb_internal.h"
 #include "hugetlb_vmemmap.h"
 
@@ -110,7 +105,7 @@ static struct liveupdate_flb_ops hugetlb_luo_flb_ops = {
 
 static struct liveupdate_flb hugetlb_luo_flb = {
 	.ops = &hugetlb_luo_flb_ops,
-	.compatible = "hugetlb",
+	.compatible = HUGETLB_FLB_NAME,
 };
 
 static struct hugetlb_hstate_ser
@@ -173,9 +168,11 @@ unsigned long __init hstate_liveupdate_pages(struct hstate *h)
 	struct hugetlb_hstate_ser *hser;
 	struct hugetlb_ser *hugetlb_ser;
 	u64 data;
+	int err;
 
-	data = liveupdate_flb_incoming_early(HUGETLB_FLB_NAME);
-	if (!data)
+	err = liveupdate_flb_incoming_early(&hugetlb_luo_flb, &data);
+	if (err)
+		/* If FLB can't be fetched, assume no pages from liveupdate. */
 		return 0;
 
 	hugetlb_ser = phys_to_virt(data);

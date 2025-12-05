@@ -193,22 +193,38 @@ static int luo_flb_retrieve_one(struct liveupdate_flb *flb)
 	return 0;
 }
 
-/* TODO: Docs. Mention it should read-only and when it can be called. */
-/* TODO: Should return be int and take u64 pointer? */
-u64 __init liveupdate_flb_incoming_early(const char *name)
+/**
+ * liveupdate_flb_incoming_early - Fetch FLB data in early boot.
+ * @flb:   The FLB definition
+ * @datap: Pointer to serialized state handle of the FLB
+ *
+ * This function is intended to be called during early boot, before the
+ * liveupdate subsystem is fully initialized. It must only be called after
+ * liveupdate_early_init().
+ *
+ * Directly returns the u64 handle to the serialized state of the FLB, and does
+ * not trigger its retrieve. A later fetch of the FLB will trigger the retrieve.
+ * Callers must make sure there are no side effects because of this.
+ *
+ * Return: 0 on success, -errno on failure. -ENODATA means no incoming FLB data,
+ * -ENOENT means specific FLB not found in incoming data, and -EOPNOTSUPP when
+ * live update is disabled or not early initialization not finished.
+ */
+int __init liveupdate_flb_incoming_early(struct liveupdate_flb *flb, u64 *datap)
 {
 	struct luo_flb_ser *ser;
 
 	if (!luo_early_initialized()) {
 		pr_warn("LUO FLB retrieved before LUO early init!\n");
-		return 0;
+		return -EOPNOTSUPP;
 	}
 
-	ser = luo_flb_find_ser(&luo_flb_global.incoming, name);
+	ser = luo_flb_find_ser(&luo_flb_global.incoming, flb->compatible);
 	if (IS_ERR(ser))
-		return 0;
+		return PTR_ERR(ser);
 
-	return ser->data;
+	*datap = ser->data;
+	return 0;
 }
 
 static void luo_flb_file_finish_one(struct liveupdate_flb *flb)

@@ -101,8 +101,7 @@ obj-$(CONFIG_DEVICE_MIGRATION) += migrate_device.o
 obj-$(CONFIG_TRANSPARENT_HUGEPAGE) += huge_memory.o khugepaged.o
 obj-$(CONFIG_PAGE_COUNTER) += page_counter.o
 obj-$(CONFIG_LIVEUPDATE) += memfd_luo.o
-# TODO: Should it gets its own config? Needs a dependency on hugetlb.
-obj-$(CONFIG_LIVEUPDATE) += hugetlb_luo.o
+obj-$(CONFIG_LIVEUPDATE_HUGETLB) += hugetlb_luo.o
 obj-$(CONFIG_MEMCG_V1) += memcontrol-v1.o
 obj-$(CONFIG_MEMCG) += memcontrol.o vmpressure.o
 ifdef CONFIG_SWAP

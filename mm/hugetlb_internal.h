@@ -11,11 +11,6 @@
 #include <linux/list.h>
 #include <linux/liveupdate.h>
 
-/* TODO: Have these here on in include/linux/hugetlb.h? */
-
-/* TODO: Should rename these so they is more hugetlb-specific. Or maybe avoid
- * exporting them at all if possible?
- */
 void init_new_hugetlb_folio(struct folio *folio);
 void account_new_hugetlb_folio(struct hstate *h, struct folio *folio);
 
