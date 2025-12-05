@@ -41,13 +41,13 @@ static_assert(sizeof(struct hugetlb_ser) <= PAGE_SIZE);
 
 #define HUGETLB_FLB_NAME "hugetlb-v1"
 
-struct huge_memfd_folio_ser {
+struct hugemfd_folio_ser {
 	u64 pfn:52;
 	u64 reserved:12;
 	u64 index;
 } __packed;
 
-struct huge_memfd_ser {
+struct hugemfd_ser {
 	unsigned long size;
 	unsigned long pos;
 	unsigned long nr_folios;

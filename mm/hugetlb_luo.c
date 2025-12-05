@@ -27,8 +27,8 @@ struct hugetlb_flb_obj {
 	struct hugetlb_ser *ser;
 };
 
-struct huge_memfd_private {
-	struct huge_memfd_folio_ser *folios_ser;
+struct hugemfd_private {
+	struct hugemfd_folio_ser *folios_ser;
 	unsigned long nr_folios;
 };
 
@@ -182,7 +182,7 @@ unsigned long __init hstate_liveupdate_pages(struct hstate *h)
 	return hser ? hser->nr_pages : 0;
 }
 
-static bool huge_memfd_can_preserve(struct liveupdate_file_handler *handler,
+static bool hugemfd_can_preserve(struct liveupdate_file_handler *handler,
 				    struct file *file)
 {
 	struct inode *inode = file_inode(file);
@@ -190,14 +190,14 @@ static bool huge_memfd_can_preserve(struct liveupdate_file_handler *handler,
 	return is_file_hugepages(file) && !inode->i_nlink;
 }
 
-static void huge_memfd_unpreserve_folio(struct hstate *h, struct folio *folio)
+static void hugemfd_unpreserve_folio(struct hstate *h, struct folio *folio)
 {
 	hugetlb_flb_del_folio(h);
 	kho_unpreserve_folio(folio);
 }
 
-static int huge_memfd_preserve_folio(struct hstate *h, struct folio *folio,
-				     struct huge_memfd_folio_ser *folio_ser)
+static int hugemfd_preserve_folio(struct hstate *h, struct folio *folio,
+				  struct hugemfd_folio_ser *folio_ser)
 {
 	int err;
 
@@ -219,11 +219,11 @@ err_unpreserve:
 }
 
 static int
-huge_memfd_preserve_folios(struct huge_memfd_ser *memfd_ser, struct file *file,
-			   unsigned long *nr_foliosp,
-			   struct huge_memfd_folio_ser **out_folios_ser)
+hugemfd_preserve_folios(struct hugemfd_ser *memfd_ser, struct file *file,
+			unsigned long *nr_foliosp,
+			struct hugemfd_folio_ser **out_folios_ser)
 {
-	struct huge_memfd_folio_ser *folios_ser;
+	struct hugemfd_folio_ser *folios_ser;
 	struct inode *inode = file_inode(file);
 	struct hstate *h = hstate_inode(inode);
 	unsigned int max_folios;
@@ -272,7 +272,7 @@ huge_memfd_preserve_folios(struct huge_memfd_ser *memfd_ser, struct file *file,
 	}
 
 	for (i = 0; i < nr_folios; i++) {
-		err = huge_memfd_preserve_folio(h, folios[i], &folios_ser[i]);
+		err = hugemfd_preserve_folio(h, folios[i], &folios_ser[i]);
 		if (err)
 			goto err_unpreserve;
 	}
@@ -290,7 +290,7 @@ huge_memfd_preserve_folios(struct huge_memfd_ser *memfd_ser, struct file *file,
 
 err_unpreserve:
 	for (i = i - 1; i >= 0; i--)
-		huge_memfd_unpreserve_folio(h, folios[i]);
+		hugemfd_unpreserve_folio(h, folios[i]);
 	vfree(folios_ser);
 err_unpin:
 	unpin_folios(folios, nr_folios);
@@ -299,14 +299,14 @@ err_free_folios:
 	return err;
 }
 
-static int huge_memfd_preserve(struct liveupdate_file_op_args *args)
+static int hugemfd_preserve(struct liveupdate_file_op_args *args)
 {
 	struct file *file = args->file;
 	struct inode *inode = file_inode(file);
 	struct hstate *h = hstate_inode(inode);
-	struct huge_memfd_folio_ser *folios_ser;
-	struct huge_memfd_private *private;
-	struct huge_memfd_ser *memfd_ser;
+	struct hugemfd_folio_ser *folios_ser;
+	struct hugemfd_private *private;
+	struct hugemfd_ser *memfd_ser;
 	unsigned long nr_folios;
 	int err;
 
@@ -328,7 +328,7 @@ static int huge_memfd_preserve(struct liveupdate_file_op_args *args)
 	memfd_ser->pos = file->f_pos;
 	memfd_ser->order = h->order;
 
-	err = huge_memfd_preserve_folios(memfd_ser, file, &nr_folios, &folios_ser);
+	err = hugemfd_preserve_folios(memfd_ser, file, &nr_folios, &folios_ser);
 	if (err)
 		goto err_unlock;
 
@@ -349,10 +349,10 @@ err_free_private:
 	return err;
 }
 
-static void huge_memfd_unpreserve_folios(struct huge_memfd_ser *memfd_ser,
-					 struct huge_memfd_folio_ser *folios_ser,
-					 unsigned long nr_folios,
-					 struct hstate *h)
+static void hugemfd_unpreserve_folios(struct hugemfd_ser *memfd_ser,
+				      struct hugemfd_folio_ser *folios_ser,
+				      unsigned long nr_folios,
+				      struct hstate *h)
 {
 	if (!nr_folios)
 		return;
@@ -362,22 +362,22 @@ static void huge_memfd_unpreserve_folios(struct huge_memfd_ser *memfd_ser,
 	for (long i = 0; i < nr_folios; i++) {
 		struct folio *folio = pfn_folio(folios_ser[i].pfn);
 
-		huge_memfd_unpreserve_folio(h, folio);
+		hugemfd_unpreserve_folio(h, folio);
 		unpin_folio(folio);
 	}
 
 	vfree(folios_ser);
 }
 
-static void huge_memfd_unpreserve(struct liveupdate_file_op_args *args)
+static void hugemfd_unpreserve(struct liveupdate_file_op_args *args)
 {
-	struct huge_memfd_ser *memfd_ser = phys_to_virt(args->serialized_data);
-	struct huge_memfd_private *private = args->private_data;
+	struct hugemfd_ser *memfd_ser = phys_to_virt(args->serialized_data);
+	struct hugemfd_private *private = args->private_data;
 	struct inode *inode = file_inode(args->file);
 	struct hstate *h = hstate_inode(inode);
 
 	inode_lock(inode);
-	huge_memfd_unpreserve_folios(memfd_ser, private->folios_ser,
+	hugemfd_unpreserve_folios(memfd_ser, private->folios_ser,
 				     private->nr_folios, h);
 	hugetlb_i_freeze(inode, false);
 	kho_unpreserve_free(memfd_ser);
@@ -385,9 +385,9 @@ static void huge_memfd_unpreserve(struct liveupdate_file_op_args *args)
 	inode_unlock(inode);
 }
 
-static int huge_memfd_freeze(struct liveupdate_file_op_args *args)
+static int hugemfd_freeze(struct liveupdate_file_op_args *args)
 {
-	struct huge_memfd_ser *memfd_ser = phys_to_virt(args->serialized_data);
+	struct hugemfd_ser *memfd_ser = phys_to_virt(args->serialized_data);
 
 	/*
 	 * The pos might have changed since prepare. Everything else stays the
@@ -397,10 +397,10 @@ static int huge_memfd_freeze(struct liveupdate_file_op_args *args)
 	return 0;
 }
 
-static void huge_memfd_finish(struct liveupdate_file_op_args *args)
+static void hugemfd_finish(struct liveupdate_file_op_args *args)
 {
-	struct huge_memfd_ser *memfd_ser = phys_to_virt(args->serialized_data);
-	struct huge_memfd_folio_ser *folios_ser;
+	struct hugemfd_ser *memfd_ser = phys_to_virt(args->serialized_data);
+	struct hugemfd_folio_ser *folios_ser;
 	LIST_HEAD(folio_list);
 	struct hstate *h;
 
@@ -450,7 +450,7 @@ err_free_all:
 	vfree(folios_ser);
 }
 
-static int huge_memfd_setup_rsrv(struct inode *inode)
+static int hugemfd_setup_rsrv(struct inode *inode)
 {
 	struct hstate *h = hstate_inode(inode);
 	long chg, regions_needed, add = -1;
@@ -479,7 +479,7 @@ static int huge_memfd_setup_rsrv(struct inode *inode)
 	/*
 	 * No need for hugetlb_acct_memory() to update h->resv_huge_pages since
 	 * the reserved pages we added here will get used immediately after in
-	 * huge_memfd_retrieve_folios().
+	 * hugemfd_retrieve_folios().
 	 *
 	 * No need for subpool reservations as well since the memfds come from
 	 * the internal mounts of hugetlbfs and that doesn't have subpools.
@@ -502,7 +502,7 @@ err_region_abort:
 	return err;
 }
 
-static struct folio *huge_memfd_retrieve_folio(struct huge_memfd_folio_ser *folio_ser)
+static struct folio *hugemfd_retrieve_folio(struct hugemfd_folio_ser *folio_ser)
 {
 	struct folio *folio;
 
@@ -517,7 +517,7 @@ static struct folio *huge_memfd_retrieve_folio(struct huge_memfd_folio_ser *foli
 	return folio;
 }
 
-static void huge_memfd_add_folios(struct hstate *h, struct list_head *folio_list)
+static void hugemfd_add_folios(struct hstate *h, struct list_head *folio_list)
 {
 	unsigned long flags;
 	struct folio *folio, *tmp_f;
@@ -534,10 +534,10 @@ static void huge_memfd_add_folios(struct hstate *h, struct list_head *folio_list
 	spin_unlock_irqrestore(&hugetlb_lock, flags);
 }
 
-static int huge_memfd_retrieve_folios(struct file *file,
-				      struct huge_memfd_ser *memfd_ser)
+static int hugemfd_retrieve_folios(struct file *file,
+				      struct hugemfd_ser *memfd_ser)
 {
-	struct huge_memfd_folio_ser *folios_ser;
+	struct hugemfd_folio_ser *folios_ser;
 	struct inode *inode = file_inode(file);
 	struct hstate *h = hstate_inode(inode);
 	int err, hidx = hstate_index(h);
@@ -561,9 +561,9 @@ static int huge_memfd_retrieve_folios(struct file *file,
 
 	/* First prepare the folios and add them to the hstate. */
 	for (i = 0; i < nr_folios; i++) {
-		struct huge_memfd_folio_ser *folio_ser = &folios_ser[i];
+		struct hugemfd_folio_ser *folio_ser = &folios_ser[i];
 
-		folio = huge_memfd_retrieve_folio(folio_ser);
+		folio = hugemfd_retrieve_folio(folio_ser);
 		if (!folio) {
 			err = -EINVAL;
 			goto err_free_folios_ser;
@@ -572,7 +572,7 @@ static int huge_memfd_retrieve_folios(struct file *file,
 		list_add(&folio->lru, &list);
 	}
 
-	huge_memfd_add_folios(h, &list);
+	hugemfd_add_folios(h, &list);
 
 	/* Now that all the folios are prepared, add them to the file. */
 	for (i = 0; i < nr_folios; i++) {
@@ -626,9 +626,9 @@ err_free_folios_ser:
  * to userspace and let it decide how to recover, usually by rebooting the
  * system.
  */
-static int huge_memfd_retrieve(struct liveupdate_file_op_args *args)
+static int hugemfd_retrieve(struct liveupdate_file_op_args *args)
 {
-	struct huge_memfd_ser *memfd_ser;
+	struct hugemfd_ser *memfd_ser;
 	struct file *file;
 	int err;
 
@@ -644,12 +644,12 @@ static int huge_memfd_retrieve(struct liveupdate_file_op_args *args)
 	vfs_setpos(file, memfd_ser->pos, MAX_LFS_FILESIZE);
 	file->f_inode->i_size = memfd_ser->size;
 
-	err = huge_memfd_setup_rsrv(file_inode(file));
+	err = hugemfd_setup_rsrv(file_inode(file));
 	if (err)
 		goto err_free_memfd_ser;
 
 	if (memfd_ser->nr_folios) {
-		err = huge_memfd_retrieve_folios(file, memfd_ser);
+		err = hugemfd_retrieve_folios(file, memfd_ser);
 		if (err)
 			goto err_free_memfd_ser;
 	}
@@ -663,19 +663,18 @@ err_free_memfd_ser:
 	return err;
 }
 
-/* TODO: Use hugemfd as prefix to name names shorter? */
-static const struct liveupdate_file_ops huge_memfd_luo_ops = {
-	.can_preserve = huge_memfd_can_preserve,
-	.preserve = huge_memfd_preserve,
-	.unpreserve = huge_memfd_unpreserve,
-	.freeze = huge_memfd_freeze,
-	.finish = huge_memfd_finish,
-	.retrieve = huge_memfd_retrieve,
+static const struct liveupdate_file_ops hugemfd_luo_ops = {
+	.can_preserve = hugemfd_can_preserve,
+	.preserve = hugemfd_preserve,
+	.unpreserve = hugemfd_unpreserve,
+	.freeze = hugemfd_freeze,
+	.finish = hugemfd_finish,
+	.retrieve = hugemfd_retrieve,
 	.owner = THIS_MODULE,
 };
 
-static struct liveupdate_file_handler huge_memfd_handler = {
-	.ops = &huge_memfd_luo_ops,
+static struct liveupdate_file_handler hugemfd_handler = {
+	.ops = &hugemfd_luo_ops,
 	.compatible = "huge-memfd-v1",
 };
 
@@ -686,16 +685,16 @@ void __init hugetlb_luo_init(void)
 	if (!liveupdate_enabled())
 		return;
 
-	err = liveupdate_register_file_handler(&huge_memfd_handler);
+	err = liveupdate_register_file_handler(&hugemfd_handler);
 	if (err) {
 		pr_err("could not register file handler: %pe\n", ERR_PTR(err));
 		return;
 	}
 
-	err = liveupdate_register_flb(&huge_memfd_handler, &hugetlb_luo_flb);
+	err = liveupdate_register_flb(&hugemfd_handler, &hugetlb_luo_flb);
 	if (err) {
 		pr_err("could not register hugetlb FLB handler: %pe\n", ERR_PTR(err));
-		liveupdate_unregister_file_handler(&huge_memfd_handler);
+		liveupdate_unregister_file_handler(&hugemfd_handler);
 		return;
 	}
 }
