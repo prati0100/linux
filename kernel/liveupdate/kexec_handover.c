@@ -1434,15 +1434,31 @@ static void __init kho_release_scratch(void)
 
 void __init kho_memory_init(void)
 {
+	kho_mem_early_init();
+
+	if (kho_in.scratch_phys)
+		kho_release_scratch();
+}
+
+static bool kho_early_initialized;
+
+void __init kho_mem_early_init(void)
+{
+	if (kho_early_initialized)
+		return;
+
 	if (kho_in.scratch_phys) {
 		kho_scratch = phys_to_virt(kho_in.scratch_phys);
-		kho_release_scratch();
 
 		if (!kho_mem_deserialize(kho_get_fdt()))
 			kho_in.fdt_phys = 0;
+
+		memblock_clear_kho_scratch_only();
 	} else {
 		kho_reserve_scratch();
 	}
+
+	kho_early_initialized = true;
 }
 
 void __init kho_populate(phys_addr_t fdt_phys, u64 fdt_len,

@@ -840,8 +840,7 @@ long region_chg(struct resv_map *resv, long f, long t, long *out_regions_needed)
  * routine.  They are kept to make reading the calling code easier as
  * arguments will match the associated region_chg call.
  */
-static void region_abort(struct resv_map *resv, long f, long t,
-			 long regions_needed)
+void region_abort(struct resv_map *resv, long f, long t, long regions_needed)
 {
 	spin_lock(&resv->lock);
 	VM_BUG_ON(!resv->region_cache_count);
@@ -1997,8 +1996,7 @@ static struct folio *alloc_fresh_hugetlb_folio(struct hstate *h,
 	return folio;
 }
 
-static void prep_and_add_allocated_folios(struct hstate *h,
-					  struct list_head *folio_list)
+void prep_and_add_allocated_folios(struct hstate *h, struct list_head *folio_list)
 {
 	unsigned long flags;
 	struct folio *folio, *tmp_f;
@@ -3496,13 +3494,13 @@ static bool __init hugetlb_hstate_alloc_pages_specific_nodes(struct hstate *h,
 	int i;
 	bool node_specific_alloc = false;
 
-	if (liveupdated) {
-		pr_warn("HugeTLB: node-specific allocation not supported with liveupdate. Will default to normal\n");
-		return false;
-	}
-
 	for_each_online_node(i) {
 		if (h->max_huge_pages_node[i] > 0) {
+			if (liveupdated) {
+				pr_warn("HugeTLB: node-specific allocation not supported with liveupdate. Defaulting to normal\n");
+				return false;
+			}
+
 			hugetlb_hstate_alloc_pages_onenode(h, i);
 			node_specific_alloc = true;
 		}
@@ -3525,7 +3523,7 @@ static void __init hugetlb_hstate_alloc_pages_errcheck(unsigned long allocated,
 		h->max_huge_pages = liveupdated;
 	} else  if (liveupdated + allocated < h->max_huge_pages) {
 		pr_warn("HugeTLB: allocating %lu of page size %s failed.  Only allocated %lu hugepages.\n",
-			h->max_huge_pages, buf, allocated);
+			liveupdated - h->max_huge_pages, buf, allocated);
 		if (liveupdated)
 			pr_warn("HugeTLB: %lu of page size %s are from liveupdate\n",
 				liveupdated, buf);

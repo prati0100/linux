@@ -331,9 +331,6 @@ static int huge_memfd_preserve(struct liveupdate_file_op_args *args)
 	memfd_ser->pos = file->f_pos;
 	memfd_ser->order = h->order;
 
-	if (err)
-		goto err_unlock;
-
 	err = huge_memfd_preserve_folios(memfd_ser, file, &nr_folios, &folios_ser);
 	if (err)
 		goto err_unlock;
@@ -406,19 +403,60 @@ static int huge_memfd_freeze(struct liveupdate_file_op_args *args)
 static void huge_memfd_finish(struct liveupdate_file_op_args *args)
 {
 	struct huge_memfd_ser *memfd_ser = phys_to_virt(args->serialized_data);
+	struct huge_memfd_folio_ser *folios_ser;
+	LIST_HEAD(folio_list);
+	struct hstate *h;
 
 	if (args->retrieved)
 		return;
 
-	if (memfd_ser->nr_folios) {
-		/* TODO: Add the folios back in hstate. */
+	folios_ser = kho_restore_vmalloc(&memfd_ser->folios);
+	if (WARN_ON_ONCE(!folios_ser))
+		return;
+
+	h = size_to_hstate(PAGE_SIZE << memfd_ser->order);
+	if (!h) {
+		pr_warn("no hstate found for order %u\n", memfd_ser->order);
+		goto err_free_all;
 	}
+
+	/* Return the folios back to the hstate. */
+	for (long i = 0; i < memfd_ser->nr_folios; i++) {
+		struct folio *folio;
+
+		folio = kho_restore_folio(PFN_PHYS(folios_ser[i].pfn));
+		if (!folio)
+			continue;
+
+		if (!folio_ref_freeze(folio, 1)) {
+			pr_warn("unexpected refcount on PFN 0x%lx\n",
+				folio_pfn(folio));
+			continue;
+		}
+
+		init_new_hugetlb_folio(folio);
+		list_add(&folio->lru, &folio_list);
+	}
+
+	prep_and_add_allocated_folios(h, &folio_list);
+	vfree(folios_ser);
+	return;
+
+err_free_all:
+	for (long i = 0; i < memfd_ser->nr_folios; i++) {
+		struct folio *folio;
+
+		folio = kho_restore_folio(PFN_PHYS(folios_ser[i].pfn));
+		if (folio)
+			folio_put(folio);
+	}
+	vfree(folios_ser);
 }
 
 static int huge_memfd_setup_rsrv(struct inode *inode)
 {
 	struct hstate *h = hstate_inode(inode);
-	long chg, regions_needed, add;
+	long chg, regions_needed, add = -1;
 	/*
 	 * NOTE: Setting up the reservations for the whole file works right now
 	 * because during preserve all the folios are filled in when pinning.
@@ -426,42 +464,45 @@ static int huge_memfd_setup_rsrv(struct inode *inode)
 	 */
 	long from = 0, to = inode->i_size >> huge_page_shift(h);
 	struct resv_map *resv_map;
-	struct hugetlb_cgroup *h_cg;
+	struct hugetlb_cgroup *h_cg = NULL;
+	int err;
 
 	resv_map = inode_resv_map(inode);
 	chg = region_chg(resv_map, from, to, &regions_needed);
 	if (chg < 0)
 		return chg;
 
-	/* TODO: Double-check accounting.  */
-	/*
-	 * TODO: Make sure the rsvd charging is needed even when pages are
-	 * already allocated.
-	 */
 	if (hugetlb_cgroup_charge_cgroup_rsvd(hstate_index(h),
 					      chg * pages_per_huge_page(h),
-					      &h_cg) < 0)
-		goto err_todo;
+					      &h_cg) < 0) {
+		err = -ENOMEM;
+		goto err_region_abort;
+	}
 
 	/*
-	 * No need for hugetlb_acct_memory(). Only the allocated folios are
-	 * added right now, and those are already accounted for during hstate
-	 * init as non-free.
+	 * No need for hugetlb_acct_memory() to update h->resv_huge_pages since
+	 * the reserved pages we added here will get used immediately after in
+	 * huge_memfd_retrieve_folios().
 	 *
 	 * No need for subpool reservations as well since the memfds come from
 	 * the internal mounts of hugetlbfs and that doesn't have subpools.
 	 */
 	add = region_add(resv_map, from, to, regions_needed, h, h_cg);
-	if (add < 0)
-		goto err_todo;
+	if (add < 0) {
+		err = add;
+		goto err_uncharge_cgroup;
+	}
 
 	hugetlb_cgroup_put_rsvd_cgroup(h_cg);
 
 	return 0;
 
-err_todo:
-	/* TODO */
-	return -EINVAL;
+err_uncharge_cgroup:
+	hugetlb_cgroup_uncharge_cgroup_rsvd(hstate_index(h),
+					    chg * pages_per_huge_page(h), h_cg);
+err_region_abort:
+	region_abort(resv_map, from, to, regions_needed);
+	return err;
 }
 
 static struct folio *huge_memfd_retrieve_folio(struct huge_memfd_folio_ser *folio_ser)
@@ -474,6 +515,8 @@ static struct folio *huge_memfd_retrieve_folio(struct huge_memfd_folio_ser *foli
 
 	init_new_hugetlb_folio(folio);
 	__folio_mark_uptodate(folio);
+	folio_ref_freeze(folio, 1);
+
 	return folio;
 }
 
@@ -505,6 +548,7 @@ static int huge_memfd_retrieve_folios(struct file *file,
 	struct address_space *mapping;
 	struct hugetlb_cgroup *h_cg;
 	unsigned long nr_folios;
+	struct folio *folio;
 	LIST_HEAD(list);
 	long i = 0;
 
@@ -521,12 +565,11 @@ static int huge_memfd_retrieve_folios(struct file *file,
 	/* First prepare the folios and add them to the hstate. */
 	for (i = 0; i < nr_folios; i++) {
 		struct huge_memfd_folio_ser *folio_ser = &folios_ser[i];
-		struct folio *folio;
 
 		folio = huge_memfd_retrieve_folio(folio_ser);
 		if (!folio) {
 			err = -EINVAL;
-			goto err_restore_folios;
+			goto err_free_folios_ser;
 		}
 
 		list_add(&folio->lru, &list);
@@ -536,35 +579,32 @@ static int huge_memfd_retrieve_folios(struct file *file,
 
 	/* Now that all the folios are prepared, add them to the file. */
 	for (i = 0; i < nr_folios; i++) {
-		struct folio *folio = pfn_folio(folios_ser[i].pfn);
+		folio = pfn_folio(folios_ser[i].pfn);
+		folio_ref_unfreeze(folio, 1);
 
 		err = hugetlb_add_to_page_cache(folio, mapping,
 						folios_ser[i].index >> memfd_ser->order);
 		if (err) {
 			pr_err("failed to add to page cache: %pe\n", ERR_PTR(err));
-			folio_put(folio);
-			goto err_restore_folios;
+			goto err_free_folios_ser;
 		}
 
 		spin_lock_irq(&hugetlb_lock);
-		/* TODO: Revisit cgroup charging. */
 		err = hugetlb_cgroup_charge_cgroup(hidx, pages_per_huge_page(h),
 						   &h_cg);
 		if (err) {
 			spin_unlock_irq(&hugetlb_lock);
-			goto err_todo;
+			folio_unlock(folio);
+			goto err_free_folios_ser;
 		}
-
 		hugetlb_cgroup_commit_charge(hidx, pages_per_huge_page(h), h_cg, folio);
-		/* TODO: Should we commit the cgroup charge here? How does this
-		 * commit system even work? */
-		hugetlb_cgroup_commit_charge_rsvd(hidx, pages_per_huge_page(h),
-						  h_cg, folio);
 		spin_unlock_irq(&hugetlb_lock);
 
 		err = mem_cgroup_charge_hugetlb(folio, gfp);
-		if (err)
-			goto err_todo;
+		if (err) {
+			folio_unlock(folio);
+			goto err_free_folios_ser;
+		}
 
 		folio_unlock(folio);
 		folio_put(folio);
@@ -573,33 +613,35 @@ static int huge_memfd_retrieve_folios(struct file *file,
 	vfree(folios_ser);
 	return 0;
 
-err_todo:
-	/* TODO: Revisit. Make sure error handling is done right. */
-err_restore_folios:
-	/* TODO: Free the other folios of this file. */
-
+err_free_folios_ser:
+	/*
+	 * NOTE: The folios of the file might be in use for DMA or other
+	 * things. It is unsafe to free them. Leak them, and let userspace get
+	 * the error code and decide what to do.
+	 */
 	vfree(folios_ser);
 	return err;
 }
 
+/*
+ * NOTE: Leaking the file in the error paths is intentional here. The memory
+ * might be in use by devices, and it is unsafe to release it. Return the error
+ * to userspace and let it decide how to recover, usually by rebooting the
+ * system.
+ */
 static int huge_memfd_retrieve(struct liveupdate_file_op_args *args)
 {
 	struct huge_memfd_ser *memfd_ser;
-	struct folio *folio;
 	struct file *file;
 	int err;
 
-	folio = kho_restore_folio(args->serialized_data);
-	if (!folio)
-		return -ENOENT;
-
-	memfd_ser = folio_address(folio);
+	memfd_ser = phys_to_virt(args->serialized_data);
 
 	file = hugetlb_file_setup("", 0, VM_NORESERVE, HUGETLB_ANONHUGE_INODE,
 				  memfd_ser->order + PAGE_SHIFT);
 	if (IS_ERR(file)) {
 		err = PTR_ERR(file);
-		goto err_put_folio;
+		goto err_free_memfd_ser;
 	}
 
 	vfs_setpos(file, memfd_ser->pos, MAX_LFS_FILESIZE);
@@ -607,22 +649,20 @@ static int huge_memfd_retrieve(struct liveupdate_file_op_args *args)
 
 	err = huge_memfd_setup_rsrv(file_inode(file));
 	if (err)
-		goto err_put_file;
+		goto err_free_memfd_ser;
 
 	if (memfd_ser->nr_folios) {
 		err = huge_memfd_retrieve_folios(file, memfd_ser);
 		if (err)
-			goto err_put_file;
+			goto err_free_memfd_ser;
 	}
 
 	args->file = file;
-	folio_put(folio);
+	kho_restore_free(memfd_ser);
 	return 0;
 
-err_put_file:
-	fput(file);
-err_put_folio:
-	folio_put(folio);
+err_free_memfd_ser:
+	kho_restore_free(memfd_ser);
 	return err;
 }
 

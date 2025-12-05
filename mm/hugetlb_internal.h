@@ -22,6 +22,8 @@ void account_new_hugetlb_folio(struct hstate *h, struct folio *folio);
 long region_chg(struct resv_map *resv, long f, long t, long *out_regions_needed);
 long region_add(struct resv_map *resv, long f, long t, long in_regions_needed,
 		struct hstate *h, struct hugetlb_cgroup *h_cg);
+void region_abort(struct resv_map *resv, long f, long t, long regions_needed);
+void prep_and_add_allocated_folios(struct hstate *h, struct list_head *folio_list);
 
 static inline struct resv_map *inode_resv_map(struct inode *inode)
 {
