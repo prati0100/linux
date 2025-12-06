@@ -724,9 +724,8 @@ out_of_memory:
  * fail; region_chg will always allocate at least 1 entry and a region_add for
  * 1 page will only require at most 1 entry.
  */
-static long region_add(struct resv_map *resv, long f, long t,
-		       long in_regions_needed, struct hstate *h,
-		       struct hugetlb_cgroup *h_cg)
+long region_add(struct resv_map *resv, long f, long t, long in_regions_needed,
+		struct hstate *h, struct hugetlb_cgroup *h_cg)
 {
 	long add = 0, actual_regions_needed = 0;
 
@@ -791,8 +790,7 @@ retry:
  * zero.  -ENOMEM is returned if a new file_region structure or cache entry
  * is needed and can not be allocated.
  */
-static long region_chg(struct resv_map *resv, long f, long t,
-		       long *out_regions_needed)
+long region_chg(struct resv_map *resv, long f, long t, long *out_regions_needed)
 {
 	long chg = 0;
 
@@ -827,8 +825,7 @@ static long region_chg(struct resv_map *resv, long f, long t,
  * routine.  They are kept to make reading the calling code easier as
  * arguments will match the associated region_chg call.
  */
-static void region_abort(struct resv_map *resv, long f, long t,
-			 long regions_needed)
+void region_abort(struct resv_map *resv, long f, long t, long regions_needed)
 {
 	spin_lock(&resv->lock);
 	VM_BUG_ON(!resv->region_cache_count);
@@ -1123,11 +1120,6 @@ void resv_map_release(struct kref *ref)
 	VM_BUG_ON(resv_map->adds_in_progress);
 
 	kfree(resv_map);
-}
-
-static inline struct resv_map *inode_resv_map(struct inode *inode)
-{
-	return HUGETLBFS_I(inode)->resv_map;
 }
 
 static struct resv_map *vma_resv_map(struct vm_area_struct *vma)
@@ -1752,7 +1744,7 @@ void free_huge_folio(struct folio *folio)
 /*
  * Must be called with the hugetlb lock held
  */
-static void account_new_hugetlb_folio(struct hstate *h, struct folio *folio)
+void account_new_hugetlb_folio(struct hstate *h, struct folio *folio)
 {
 	lockdep_assert_held(&hugetlb_lock);
 	h->nr_huge_pages++;
