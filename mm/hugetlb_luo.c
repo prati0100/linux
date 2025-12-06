@@ -4,7 +4,7 @@
  * Copyright (C) 2025 Pratyush Yadav <pratyush@kernel.org>
  */
 
-/* TODO: Docs */
+/* The documentation for this is in mm/memfd_luo.c */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
@@ -33,8 +33,8 @@ struct hugemfd_private {
 static int hugetlb_flb_preserve(struct liveupdate_flb_op_args *args)
 {
 	struct hugetlb_ser *hugetlb_ser;
-	unsigned short nr_hstates = 0;
 	struct hugetlb_flb_obj *obj;
+	u8 nr_hstates = 0;
 	struct hstate *h;
 
 	obj = kmalloc(sizeof(*obj), GFP_KERNEL);
@@ -103,13 +103,13 @@ static struct liveupdate_flb_ops hugetlb_luo_flb_ops = {
 
 static struct liveupdate_flb hugetlb_luo_flb = {
 	.ops = &hugetlb_luo_flb_ops,
-	.compatible = HUGETLB_FLB_NAME,
+	.compatible = HUGETLB_FLB_COMPATIBLE,
 };
 
 static struct hugetlb_hstate_ser
-*hugetlb_flb_get_hser(struct hugetlb_ser *hugetlb_ser, unsigned short order)
+*hugetlb_flb_get_hser(struct hugetlb_ser *hugetlb_ser, unsigned int order)
 {
-	for (unsigned short i = 0; i < hugetlb_ser->nr_hstates; i++) {
+	for (u8 i = 0; i < hugetlb_ser->nr_hstates; i++) {
 		if (hugetlb_ser->hstates[i].order == order)
 			return &hugetlb_ser->hstates[i];
 	}
@@ -416,7 +416,7 @@ static void hugemfd_finish(struct liveupdate_file_op_args *args)
 	}
 
 	/* Return the folios back to the hstate. */
-	for (long i = 0; i < memfd_ser->nr_folios; i++) {
+	for (u64 i = 0; i < memfd_ser->nr_folios; i++) {
 		struct folio *folio;
 
 		folio = kho_restore_folio(PFN_PHYS(folios_ser[i].pfn));
@@ -438,7 +438,7 @@ static void hugemfd_finish(struct liveupdate_file_op_args *args)
 	return;
 
 err_free_all:
-	for (long i = 0; i < memfd_ser->nr_folios; i++) {
+	for (u64 i = 0; i < memfd_ser->nr_folios; i++) {
 		struct folio *folio;
 
 		folio = kho_restore_folio(PFN_PHYS(folios_ser[i].pfn));
@@ -542,10 +542,9 @@ static int hugemfd_retrieve_folios(struct file *file,
 	gfp_t gfp = htlb_alloc_mask(h) | __GFP_RETRY_MAYFAIL;
 	struct address_space *mapping;
 	struct hugetlb_cgroup *h_cg;
-	unsigned long nr_folios;
 	struct folio *folio;
 	LIST_HEAD(list);
-	long i = 0;
+	u64 nr_folios;
 
 	if (!memfd_ser->size)
 		return 0;
@@ -558,7 +557,7 @@ static int hugemfd_retrieve_folios(struct file *file,
 	mapping = inode->i_mapping;
 
 	/* First prepare the folios and add them to the hstate. */
-	for (i = 0; i < nr_folios; i++) {
+	for (u64 i = 0; i < nr_folios; i++) {
 		struct hugemfd_folio_ser *folio_ser = &folios_ser[i];
 
 		folio = hugemfd_retrieve_folio(folio_ser);
@@ -573,7 +572,7 @@ static int hugemfd_retrieve_folios(struct file *file,
 	hugemfd_add_folios(h, &list);
 
 	/* Now that all the folios are prepared, add them to the file. */
-	for (i = 0; i < nr_folios; i++) {
+	for (u64 i = 0; i < nr_folios; i++) {
 		folio = pfn_folio(folios_ser[i].pfn);
 		folio_ref_unfreeze(folio, 1);
 
@@ -673,7 +672,7 @@ static const struct liveupdate_file_ops hugemfd_luo_ops = {
 
 static struct liveupdate_file_handler hugemfd_handler = {
 	.ops = &hugemfd_luo_ops,
-	.compatible = "huge-memfd-v1",
+	.compatible = HUGE_MEMFD_COMPATIBLE,
 };
 
 void __init hugetlb_luo_init(void)

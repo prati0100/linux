@@ -218,20 +218,6 @@ static int __init luo_late_startup(void)
 {
 	int err;
 
-	/*
-	 * HACK: This is done because the early init is moved to setup_arch on
-	 * x86. So double-check if KHO init failed after that, for example when
-	 * parsing the bitmaps.
-	 *
-	 * Should maybe find a better way to do this.
-	 */
-	if (!kho_is_enabled()) {
-		if (liveupdate_enabled())
-			pr_warn("Disabling liveupdate because KHO is disabled\n");
-		luo_global.enabled = false;
-		return 0;
-	}
-
 	if (!liveupdate_enabled())
 		return 0;
 
