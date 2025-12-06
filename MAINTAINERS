@@ -15054,6 +15054,7 @@ F:	include/linux/liveupdate.h
 F:	include/uapi/linux/liveupdate.h
 F:	kernel/liveupdate/
 F:	lib/tests/liveupdate.c
+F:	mm/hugetlb_luo.c
 F:	mm/memfd_luo.c
 F:	tools/testing/selftests/liveupdate/
 
