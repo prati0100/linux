@@ -67,6 +67,7 @@
 static struct {
 	bool enabled;
 	struct luo_ser *luo_ser_out;
+	struct luo_ser *luo_ser_in;
 	u64 liveupdate_num;
 } luo_global;
 
@@ -81,7 +82,7 @@ static int __init early_liveupdate_param(char *buf)
 }
 early_param("liveupdate", early_liveupdate_param);
 
-static int __init luo_early_startup(void)
+void __init liveupdate_init_early(void)
 {
 	phys_addr_t luo_ser_phys;
 	struct luo_ser *luo_ser;
@@ -92,7 +93,7 @@ static int __init luo_early_startup(void)
 		if (liveupdate_enabled())
 			pr_warn("Disabling liveupdate because KHO is disabled\n");
 		luo_global.enabled = false;
-		return 0;
+		return;
 	}
 
 	/* Retrieve LUO state from KHO. */
@@ -101,54 +102,60 @@ static int __init luo_early_startup(void)
 		if (err != -ENOENT) {
 			pr_err("failed to retrieve LUO state '%s' from KHO: %pe\n",
 			       LUO_KHO_ENTRY_NAME, ERR_PTR(err));
-			return err;
+			goto fail;
 		}
 
-		return 0;
+		/* No LUO state. */
+		return;
 	}
 
 	if (len < sizeof(*luo_ser)) {
 		pr_err("LUO state is too small (%zu < %zu)\n", len, sizeof(*luo_ser));
-		return -EINVAL;
+		err = -EINVAL;
+		goto fail;
 	}
 
 	luo_ser = phys_to_virt(luo_ser_phys);
 	if (strncmp(luo_ser->compatible, LUO_ABI_COMPATIBLE, LUO_ABI_COMPAT_LEN)) {
 		pr_err("LUO state is incompatible with '%s'\n", LUO_ABI_COMPATIBLE);
-		return -EINVAL;
+		err = -EINVAL;
+		goto fail;
 	}
 
+	luo_global.luo_ser_in = luo_ser;
 	luo_global.liveupdate_num = luo_ser->liveupdate_num;
 	pr_info("Retrieved live update data, liveupdate number: %lld\n",
 		luo_global.liveupdate_num);
 
-	err = luo_session_setup_incoming(luo_ser->sessions_pa);
-	if (err)
-		goto out_free_ser;
-
 	luo_flb_setup_incoming(luo_ser->flbs_pa);
+	return;
 
-	err = 0;
-
-out_free_ser:
-	kho_restore_free(luo_ser);
-	return err;
+fail:
+	luo_global.enabled = false;
+	luo_restore_fail("The incoming tree failed to initialize properly [%pe], disabling live update\n",
+			 ERR_PTR(err));
 }
 
-static int __init liveupdate_early_init(void)
+static int __init luo_startup(void)
 {
 	int err;
 
-	err = luo_early_startup();
+	if (!luo_global.luo_ser_in)
+		return 0;
+
+	err = luo_session_setup_incoming(luo_global.luo_ser_in->sessions_pa);
+	kho_restore_free(luo_global.luo_ser_in);
+	luo_global.luo_ser_in = NULL;
 	if (err) {
 		luo_global.enabled = false;
-		luo_restore_fail("The incoming tree failed to initialize properly [%pe], disabling live update\n",
+		luo_restore_fail("Failed to setup sessions [%pe]\n",
 				 ERR_PTR(err));
+		return err;
 	}
 
-	return err;
+	return 0;
 }
-early_initcall(liveupdate_early_init);
+early_initcall(luo_startup);
 
 /* Called during boot to create outgoing LUO state */
 static int __init luo_state_setup(void)
