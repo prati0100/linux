@@ -9,6 +9,7 @@
 
 #include <linux/hugetlb.h>
 #include <linux/hugetlb_cgroup.h>
+#include <linux/liveupdate.h>
 
 /*
  * Check if the hstate represents gigantic pages but gigantic page
@@ -124,5 +125,19 @@ extern void hugetlb_sysctl_init(void);
 #else
 static inline void hugetlb_sysctl_init(void) { }
 #endif
+
+#ifdef CONFIG_LIVEUPDATE_HUGETLB
+void hugetlb_luo_init(void);
+unsigned long hstate_liveupdate_pages(struct hstate *h);
+#else
+static inline void hugetlb_luo_init(void)
+{
+}
+
+static inline unsigned long hstate_liveupdate_pages(struct hstate *h)
+{
+	return 0;
+}
+#endif /* CONFIG_LIVEUPDATE_HUGETLB */
 
 #endif /* _LINUX_HUGETLB_INTERNAL_H */
