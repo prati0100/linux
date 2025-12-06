@@ -33,20 +33,18 @@ static inline struct resv_map *inode_resv_map(struct inode *inode)
 	return (struct resv_map *)(&inode->i_data)->i_private_data;
 }
 
-#ifdef CONFIG_LIVEUPDATE
-void __init hugetlb_luo_init(void);
-unsigned long __init hstate_liveupdate_pages(struct hstate *h);
+#ifdef CONFIG_LIVEUPDATE_HUGETLB
+void hugetlb_luo_init(void);
+unsigned long hstate_liveupdate_pages(struct hstate *h);
 #else
-static inline __init void hugetlb_luo_init(void)
+static inline void hugetlb_luo_init(void)
 {
 }
 
-static inline unsigned long __init hstate_liveupdate_pages(struct hstata *h)
+static inline unsigned long hstate_liveupdate_pages(struct hstate *h)
 {
 	return 0;
 }
-#endif /* CONFIG_LIVEUPDATE */
-
-
+#endif /* CONFIG_LIVEUPDATE_HUGETLB */
 
 #endif /* __HUGETLB_INTERNAL_H */

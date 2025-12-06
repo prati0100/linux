@@ -1205,12 +1205,6 @@ void __init setup_arch(char **cmdline_p)
 	dma_contiguous_reserve(max_pfn_mapped << PAGE_SHIFT);
 
 	/*
-	 * Hugepages might be preserved from a liveupdate. Make sure it is
-	 * initialized so hugetlb can query its state.
-	 */
-	liveupdate_early_init();
-
-	/*
 	 * Reserve memory for crash kernel after SRAT is parsed so that it
 	 * won't consume hotpluggable memory.
 	 */
@@ -1222,6 +1216,12 @@ void __init setup_arch(char **cmdline_p)
 	x86_init.paging.pagetable_init();
 
 	kho_mem_early_init();
+
+	/*
+	 * Hugepages might be preserved from a liveupdate. Make sure it is
+	 * initialized so hugetlb can query its state.
+	 */
+	liveupdate_early_init();
 
 	if (boot_cpu_has(X86_FEATURE_GBPAGES)) {
 		hugetlb_cma_reserve(PUD_SHIFT - PAGE_SHIFT);

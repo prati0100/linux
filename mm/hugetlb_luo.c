@@ -19,8 +19,6 @@
 #include "hugetlb_internal.h"
 #include "hugetlb_vmemmap.h"
 
-/* TODO: HugeTLB CMA support. */
-
 struct hugetlb_flb_obj {
 	/* Serializes access to ser and its hstates. */
 	spinlock_t lock;
