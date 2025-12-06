@@ -8,13 +8,22 @@
 #ifndef _LINUX_KHO_ABI_HUGETLB_H
 #define _LINUX_KHO_ABI_HUGETLB_H
 
+#include <linux/build_bug.h>
 #include <linux/hugetlb.h>
+#include <linux/types.h>
+#include <linux/kho/abi/kexec_handover.h>
+#include <linux/kho/abi/xarray.h>
 
 /**
  * DOC: hugetlb-backed memfd live update ABI
  *
  * This header defines the ABI for preserving the state of the hugetlb subsystem
  * and a hugetlb-backed memfd across a kexec reboot using LUO.
+ *
+ * The folios of a hugetlb-backed memfd are stored in a KHO xarray, keyed by the
+ * index of the hugepage in the file (the file offset divided by the hugepage
+ * size). The value is a ``union hugetlb_luo_folio_ser``. A value of 0 means
+ * there is no folio at that index.
  *
  * This interface is a contract. Any modification to the structure layout
  * constitutes a breaking change. Such changes require incrementing the version
@@ -62,5 +71,43 @@ struct hugetlb_ser {
 static_assert(sizeof(struct hugetlb_ser) <= PAGE_SIZE);
 
 #define HUGETLB_FLB_COMPATIBLE "hugetlb-v1"
+
+/**
+ * union hugetlb_luo_folio_ser - Serialized state of a single folio.
+ * @val:          The raw value stored in the KHO xarray.
+ * @pfn:          The page frame number of the folio.
+ * @flags:        Flags for the folio. Currently none are defined, so this
+ *                must be 0.
+ */
+union hugetlb_luo_folio_ser {
+	u64 val;
+	struct {
+		u64 pfn:52;
+		u64 flags:12;
+	};
+};
+
+/* It must fit into a KHO xarray entry. */
+static_assert(sizeof(union hugetlb_luo_folio_ser) == sizeof(u64));
+
+/**
+ * struct hugetlb_luo_ser - Main serialization structure of a HugeTLB-backed memfd.
+ * @size:         The total size of the file in bytes (i_size).
+ * @pos:          The file's current position (f_pos).
+ * @folios:       Folios in the file.
+ * @order:        Order of the hugepages that back this file.
+ * @reserved:     Explicit padding. Must be set to 0.
+ */
+struct hugetlb_luo_ser {
+	u64 size;
+	u64 pos;
+	struct kho_xarray folios;
+	u8 order;
+	u8 reserved[7];
+};
+
+static_assert(sizeof(struct hugetlb_luo_ser) <= PAGE_SIZE);
+
+#define HUGE_MEMFD_COMPATIBLE "huge-memfd-v1"
 
 #endif /* _LINUX_KHO_ABI_HUGETLB_H */
