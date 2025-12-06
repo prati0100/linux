@@ -229,6 +229,8 @@ struct liveupdate_flb {
 
 #ifdef CONFIG_LIVEUPDATE
 
+void liveupdate_early_init(void);
+
 /* Return true if live update orchestrator is enabled */
 bool liveupdate_enabled(void);
 
@@ -258,6 +260,10 @@ int liveupdate_get_token_outgoing(struct liveupdate_session *s,
 				  struct file *file, u64 *tokenp);
 
 #else /* CONFIG_LIVEUPDATE */
+
+static inline void liveupdate_early_init(void)
+{
+}
 
 static inline bool liveupdate_enabled(void)
 {

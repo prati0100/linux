@@ -122,20 +122,17 @@ static int __init luo_early_startup(void)
 	pr_info("Retrieved live update data, liveupdate number: %lld\n",
 		luo_global.liveupdate_num);
 
-	err = luo_session_setup_incoming(luo_ser->sessions_pa);
-	if (err)
-		goto out_free_ser;
-
+	luo_session_setup_incoming(&luo_ser->sessions_pa);
 	luo_flb_setup_incoming(luo_ser->flbs_pa);
 
-	err = 0;
-
-out_free_ser:
-	kho_restore_free(luo_ser);
-	return err;
+	return 0;
 }
 
-static int __init liveupdate_early_init(void)
+/*
+ * This should only be called after KHO FDT is known. It gets the LUO subtree
+ * and does initial validation, making early boot read-only access possible.
+ */
+void __init liveupdate_early_init(void)
 {
 	int err;
 
@@ -145,10 +142,7 @@ static int __init liveupdate_early_init(void)
 		luo_restore_fail("The incoming tree failed to initialize properly [%pe], disabling live update\n",
 				 ERR_PTR(err));
 	}
-
-	return err;
 }
-early_initcall(liveupdate_early_init);
 
 /* Called during boot to create outgoing LUO state */
 static int __init luo_state_setup(void)
