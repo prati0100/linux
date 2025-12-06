@@ -107,6 +107,17 @@ extern ssize_t __nr_hugepages_store_common(bool obey_mempolicy,
 					   unsigned long count, size_t len);
 
 extern void hugetlb_sysfs_init(void) __init;
+extern void account_new_hugetlb_folio(struct hstate *h, struct folio *folio);
+
+extern long region_chg(struct resv_map *resv, long f, long t, long *out_regions_needed);
+extern long region_add(struct resv_map *resv, long f, long t, long in_regions_needed,
+		       struct hstate *h, struct hugetlb_cgroup *h_cg);
+extern void region_abort(struct resv_map *resv, long f, long t, long regions_needed);
+
+static inline struct resv_map *inode_resv_map(struct inode *inode)
+{
+	return HUGETLBFS_I(inode)->resv_map;
+}
 
 #ifdef CONFIG_SYSCTL
 extern void hugetlb_sysctl_init(void);
