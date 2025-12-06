@@ -4,6 +4,7 @@
 #include <linux/cma.h>
 #include <linux/compiler.h>
 #include <linux/mm_inline.h>
+#include <linux/liveupdate.h>
 
 #include <asm/page.h>
 #include <asm/setup.h>
@@ -229,6 +230,12 @@ void __init hugetlb_cma_reserve(void)
 
 	if (!hugetlb_cma_size)
 		return;
+
+	if (IS_ENABLED(CONFIG_LIVEUPDATE_HUGETLB) && liveupdate_enabled()) {
+		pr_warn("HugeTLB: CMA not supported with live update. Disabling it.\n");
+		hugetlb_cma_size = 0;
+		return;
+	}
 
 	order = arch_hugetlb_cma_order();
 	if (!order) {
