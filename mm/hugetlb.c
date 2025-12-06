@@ -38,6 +38,7 @@
 #include <linux/mm_inline.h>
 #include <linux/padata.h>
 #include <linux/pgalloc.h>
+#include <linux/liveupdate.h>
 
 #include <asm/page.h>
 #include <asm/tlb.h>
@@ -59,6 +60,7 @@ struct hstate hstates[HUGE_MAX_HSTATE];
 __initdata nodemask_t hugetlb_bootmem_nodes;
 __initdata struct list_head huge_boot_pages[MAX_NUMNODES];
 static unsigned long hstate_boot_nrinvalid[HUGE_MAX_HSTATE] __initdata;
+static unsigned long hstate_boot_nrliveupdated[HUGE_MAX_HSTATE] __initdata;
 
 /*
  * Due to ordering constraints across the init code for various
@@ -3396,13 +3398,19 @@ static void __init hugetlb_hstate_alloc_pages_onenode(struct hstate *h, int nid)
 	h->max_huge_pages_node[nid] = i;
 }
 
-static bool __init hugetlb_hstate_alloc_pages_specific_nodes(struct hstate *h)
+static bool __init hugetlb_hstate_alloc_pages_specific_nodes(struct hstate *h,
+							     unsigned long liveupdated)
 {
 	int i;
 	bool node_specific_alloc = false;
 
 	for_each_online_node(i) {
 		if (h->max_huge_pages_node[i] > 0) {
+			if (liveupdated) {
+				pr_warn("HugeTLB: node-specific allocation not supported with liveupdate. Defaulting to normal\n");
+				return false;
+			}
+
 			hugetlb_hstate_alloc_pages_onenode(h, i);
 			node_specific_alloc = true;
 		}
@@ -3411,15 +3419,25 @@ static bool __init hugetlb_hstate_alloc_pages_specific_nodes(struct hstate *h)
 	return node_specific_alloc;
 }
 
-static void __init hugetlb_hstate_alloc_pages_errcheck(unsigned long allocated, struct hstate *h)
+static void __init hugetlb_hstate_alloc_pages_errcheck(unsigned long allocated,
+						       unsigned long liveupdated,
+						       struct hstate *h)
 {
-	if (allocated < h->max_huge_pages) {
-		char buf[32];
+	char buf[32];
 
-		string_get_size(huge_page_size(h), 1, STRING_UNITS_2, buf, 32);
+	string_get_size(huge_page_size(h), 1, STRING_UNITS_2, buf, 32);
+
+	if (liveupdated > h->max_huge_pages) {
+		pr_warn("HugeTLB: got %lu of page size %s from liveupdate, requested pages are %lu\n",
+			liveupdated, buf, h->max_huge_pages);
+		h->max_huge_pages = liveupdated;
+	} else  if (liveupdated + allocated < h->max_huge_pages) {
 		pr_warn("HugeTLB: allocating %lu of page size %s failed.  Only allocated %lu hugepages.\n",
-			h->max_huge_pages, buf, allocated);
-		h->max_huge_pages = allocated;
+			h->max_huge_pages - liveupdated, buf, allocated);
+		if (liveupdated)
+			pr_warn("HugeTLB: %lu of page size %s are from liveupdate\n",
+				liveupdated, buf);
+		h->max_huge_pages = allocated + liveupdated;
 	}
 }
 
@@ -3454,11 +3472,12 @@ static void __init hugetlb_pages_alloc_boot_node(unsigned long start, unsigned l
 	prep_and_add_allocated_folios(h, &folio_list);
 }
 
-static unsigned long __init hugetlb_gigantic_pages_alloc_boot(struct hstate *h)
+static unsigned long __init hugetlb_gigantic_pages_alloc_boot(struct hstate *h,
+							      unsigned long nr)
 {
 	unsigned long i;
 
-	for (i = 0; i < h->max_huge_pages; ++i) {
+	for (i = 0; i < nr; ++i) {
 		if (!alloc_bootmem_huge_page(h, NUMA_NO_NODE))
 			break;
 		cond_resched();
@@ -3467,7 +3486,8 @@ static unsigned long __init hugetlb_gigantic_pages_alloc_boot(struct hstate *h)
 	return i;
 }
 
-static unsigned long __init hugetlb_pages_alloc_boot(struct hstate *h)
+static unsigned long __init hugetlb_pages_alloc_boot(struct hstate *h,
+						     unsigned long nr)
 {
 	struct padata_mt_job job = {
 		.fn_arg		= h,
@@ -3506,14 +3526,14 @@ static unsigned long __init hugetlb_pages_alloc_boot(struct hstate *h)
 
 	jiffies_start = jiffies;
 	do {
-		remaining = h->max_huge_pages - h->nr_huge_pages;
+		remaining = nr - h->nr_huge_pages;
 
 		job.start     = h->nr_huge_pages;
 		job.size      = remaining;
 		job.min_chunk = remaining / hugepage_allocation_threads;
 		padata_do_multithreaded(&job);
 
-		if (h->nr_huge_pages == h->max_huge_pages)
+		if (h->nr_huge_pages == nr)
 			break;
 
 		/*
@@ -3524,7 +3544,7 @@ static unsigned long __init hugetlb_pages_alloc_boot(struct hstate *h)
 			break;
 
 		/* Continue if progress was made in last iteration */
-	} while (remaining != (h->max_huge_pages - h->nr_huge_pages));
+	} while (remaining != (nr - h->nr_huge_pages));
 
 	jiffies_end = jiffies;
 
@@ -3548,7 +3568,7 @@ static unsigned long __init hugetlb_pages_alloc_boot(struct hstate *h)
  */
 static void __init hugetlb_hstate_alloc_pages(struct hstate *h)
 {
-	unsigned long allocated;
+	unsigned long allocated, liveupdated, nr_alloc;
 
 	/*
 	 * Skip gigantic hugepages allocation if early CMA
@@ -3560,20 +3580,31 @@ static void __init hugetlb_hstate_alloc_pages(struct hstate *h)
 		return;
 	}
 
-	if (!h->max_huge_pages)
+	/*
+	 * Some huge pages might come from live update. They will get added to
+	 * the hstate when liveupdate retrieves its files. To avoid
+	 * over-allocating, subtract the liveupdated pages from the total number
+	 * of pages to allocate.
+	 */
+	liveupdated = hstate_liveupdate_pages(h);
+	hstate_boot_nrliveupdated[hstate_index(h)] = liveupdated;
+	if (liveupdated >= h->max_huge_pages) {
+		hugetlb_hstate_alloc_pages_errcheck(0, liveupdated, h);
 		return;
+	}
+	nr_alloc = h->max_huge_pages - liveupdated;
 
 	/* do node specific alloc */
-	if (hugetlb_hstate_alloc_pages_specific_nodes(h))
+	if (hugetlb_hstate_alloc_pages_specific_nodes(h, liveupdated))
 		return;
 
 	/* below will do all node balanced alloc */
 	if (hstate_is_gigantic(h))
-		allocated = hugetlb_gigantic_pages_alloc_boot(h);
+		allocated = hugetlb_gigantic_pages_alloc_boot(h, nr_alloc);
 	else
-		allocated = hugetlb_pages_alloc_boot(h);
+		allocated = hugetlb_pages_alloc_boot(h, nr_alloc);
 
-	hugetlb_hstate_alloc_pages_errcheck(allocated, h);
+	hugetlb_hstate_alloc_pages_errcheck(allocated, liveupdated, h);
 }
 
 static void __init hugetlb_init_hstates(void)
@@ -3622,14 +3653,22 @@ static void __init report_hugepages(void)
 	unsigned long nrinvalid;
 
 	for_each_hstate(h) {
+		unsigned long liveupdated;
 		char buf[32];
 
 		nrinvalid = hstate_boot_nrinvalid[hstate_index(h)];
 		h->max_huge_pages -= nrinvalid;
 
 		string_get_size(huge_page_size(h), 1, STRING_UNITS_2, buf, 32);
-		pr_info("HugeTLB: registered %s page size, pre-allocated %ld pages\n",
+		pr_info("HugeTLB: registered %s page size, pre-allocated %ld pages",
 			buf, h->nr_huge_pages);
+
+		liveupdated = hstate_boot_nrliveupdated[hstate_index(h)];
+		if (liveupdated)
+			pr_info(KERN_CONT ", %ld pages from liveupdate\n", liveupdated);
+		else
+			pr_info(KERN_CONT "\n");
+
 		if (nrinvalid)
 			pr_info("HugeTLB: %s page size: %lu invalid page%s discarded\n",
 					buf, nrinvalid, str_plural(nrinvalid));
