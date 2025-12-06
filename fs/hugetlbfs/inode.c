@@ -99,6 +99,7 @@ static const struct fs_parameter_spec hugetlb_fs_parameters[] = {
 static int hugetlbfs_file_mmap(struct file *file, struct vm_area_struct *vma)
 {
 	struct inode *inode = file_inode(file);
+	struct hugetlbfs_inode_info *info = HUGETLBFS_I(inode);
 	loff_t len, vma_len;
 	int ret;
 	struct hstate *h = hstate_file(file);
@@ -138,6 +139,13 @@ static int hugetlbfs_file_mmap(struct file *file, struct vm_area_struct *vma)
 
 	inode_lock(inode);
 	file_accessed(file);
+
+	/* Can't extend size of a frozen inode. */
+	if (info->frozen && vma_test(vma, VMA_WRITE_BIT) &&
+	    inode->i_size < len) {
+		ret = -EPERM;
+		goto out;
+	}
 
 	ret = -ENOMEM;
 
@@ -660,6 +668,11 @@ static long hugetlbfs_punch_hole(struct inode *inode, loff_t offset, loff_t len)
 
 	inode_lock(inode);
 
+	if (info->frozen) {
+		inode_unlock(inode);
+		return -EPERM;
+	}
+
 	/* protected by i_rwsem */
 	if (info->seals & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE)) {
 		inode_unlock(inode);
@@ -729,6 +742,11 @@ static long hugetlbfs_fallocate(struct file *file, int mode, loff_t offset,
 	end = (offset + len + hpage_size - 1) >> hpage_shift;
 
 	inode_lock(inode);
+
+	if (info->frozen) {
+		error = -EPERM;
+		goto out;
+	}
 
 	/* We need to check rlimit even when FALLOC_FL_KEEP_SIZE */
 	error = inode_newsize_ok(inode, offset + len);
@@ -851,7 +869,8 @@ static int hugetlbfs_setattr(struct mnt_idmap *idmap,
 			return -EINVAL;
 		/* protected by i_rwsem */
 		if ((newsize < oldsize && (info->seals & F_SEAL_SHRINK)) ||
-		    (newsize > oldsize && (info->seals & F_SEAL_GROW)))
+		    (newsize > oldsize && (info->seals & F_SEAL_GROW)) ||
+		    ((newsize != oldsize) && info->frozen))
 			return -EPERM;
 		hugetlb_vmtruncate(inode, newsize);
 	}
@@ -921,6 +940,7 @@ static struct inode *hugetlbfs_get_inode(struct super_block *sb,
 		simple_inode_init_ts(inode);
 		info->resv_map = resv_map;
 		info->seals = F_SEAL_SEAL;
+		info->frozen = false;
 		switch (mode & S_IFMT) {
 		default:
 			init_special_inode(inode, mode, dev);
