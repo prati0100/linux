@@ -62,6 +62,20 @@
 #include "kexec_handover_internal.h"
 #include "luo_internal.h"
 
+/*
+ * Version of the data format in the .liveupdate_versions section. Must be the
+ * first string in there.
+ *
+ * TODO: Is there a way to make sure there is only at most one of these?
+ *
+ * TODO: Should we encode version this way or should we encode it in the section
+ * name or header somehow?
+ *
+ * TODO: Better version name.
+ */
+static const char liveupdate_sec_ver[]
+	__used __section(".liveupdate_sec_ver") __aligned(1) = "lu-section-v1";
+
 static struct {
 	bool enabled;
 	void *fdt_out;

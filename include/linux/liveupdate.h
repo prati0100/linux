@@ -212,6 +212,16 @@ struct liveupdate_flb {
 	struct luo_flb_private __private private;
 };
 
+#define LIVEUPDATE_FILE_HANDLER(_name, _compatible, _ops)	\
+	static struct liveupdate_file_handler _name = {\
+		.compatible = _compatible,		\
+		.ops = _ops,				\
+	};						\
+							\
+	static const char __kstr_ ## _name ## _compat[]	\
+	__used __section(".liveupdate_versions")	\
+	__aligned(1) = _compatible;
+
 #ifdef CONFIG_LIVEUPDATE
 
 /* Return true if live update orchestrator is enabled */
