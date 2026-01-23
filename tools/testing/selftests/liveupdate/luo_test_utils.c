@@ -54,14 +54,15 @@ int luo_retrieve_session(int luo_fd, const char *name)
 	return arg.fd;
 }
 
-int create_and_preserve_memfd(int session_fd, int token, const char *data)
+int create_and_preserve_memfd(int session_fd, int token, unsigned int flags,
+			      const char *data)
 {
 	struct liveupdate_session_preserve_fd arg = { .size = sizeof(arg) };
 	long page_size = sysconf(_SC_PAGE_SIZE);
 	void *map = MAP_FAILED;
 	int mfd = -1, ret = -1;
 
-	mfd = memfd_create("test_mfd", 0);
+	mfd = memfd_create("test_mfd", flags);
 	if (mfd < 0)
 		return -errno;
 
@@ -145,7 +146,7 @@ void create_state_file(int luo_fd, const char *session_name, int token,
 		fail_exit("luo_create_session for state tracking");
 
 	snprintf(buf, sizeof(buf), "%d", next_stage);
-	if (create_and_preserve_memfd(state_session_fd, token, buf) < 0)
+	if (create_and_preserve_memfd(state_session_fd, token, 0, buf) < 0)
 		fail_exit("create_and_preserve_memfd for state tracking");
 
 	/*

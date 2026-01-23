@@ -34,7 +34,7 @@ static void run_stage_1(int luo_fd)
 	if (session_fd < 0)
 		fail_exit("luo_create_session for '%s'", TEST_SESSION_NAME);
 
-	if (create_and_preserve_memfd(session_fd, TEST_MEMFD_TOKEN,
+	if (create_and_preserve_memfd(session_fd, TEST_MEMFD_TOKEN, 0,
 				      TEST_MEMFD_DATA) < 0) {
 		fail_exit("create_and_preserve_memfd for token %#x",
 			  TEST_MEMFD_TOKEN);
