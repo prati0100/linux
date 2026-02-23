@@ -48,6 +48,8 @@ static int hugetlb_flb_preserve(struct liveupdate_flb_op_args *args)
 		return -ENOMEM;
 	}
 
+	printk("hugetlb_ser: 0x%llx\n", virt_to_phys(hugetlb_ser));
+
 	spin_lock_init(&obj->lock);
 	obj->ser = hugetlb_ser;
 
@@ -75,23 +77,16 @@ static void hugetlb_flb_unpreserve(struct liveupdate_flb_op_args *args)
 
 static void hugetlb_flb_finish(struct liveupdate_flb_op_args *args)
 {
-	/* No live state on the retrieve side. */
+	kho_restore_free(args->obj);
 }
 
 static int hugetlb_flb_retrieve(struct liveupdate_flb_op_args *args)
 {
 	/*
-	 * The FLB is only needed for boot-time calculation of how many
-	 * hugepages are needed. This is done by early boot handlers already.
-	 * Free the serialized state now.
+	 * There is nothing to deserialize. Just return the pointer to the
+	 * serialization structure. It can be used directly.
 	 */
-	kho_restore_free(phys_to_virt(args->data));
-
-	/*
-	 * HACK: But since LUO FLB still needs an obj, use ZERO_SIZE_PTR to
-	 * satisfy it.
-	 */
-	args->obj = ZERO_SIZE_PTR;
+	args->obj = phys_to_virt(args->data);
 	return 0;
 }
 
@@ -166,15 +161,12 @@ unsigned long __init hstate_liveupdate_pages(struct hstate *h)
 {
 	struct hugetlb_hstate_ser *hser;
 	struct hugetlb_ser *hugetlb_ser;
-	u64 data;
 	int err;
 
-	err = liveupdate_flb_incoming_early(&hugetlb_luo_flb, &data);
+	err = liveupdate_flb_get_incoming(&hugetlb_luo_flb, (void **)&hugetlb_ser);
 	if (err)
 		/* If FLB can't be fetched, assume no pages from liveupdate. */
 		return 0;
-
-	hugetlb_ser = phys_to_virt(data);
 
 	/* NOTE: No need for locking since this is read-only on incoming side. */
 	hser = hugetlb_flb_get_hser(hugetlb_ser, h->order);
