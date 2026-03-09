@@ -21,6 +21,8 @@
 	ksft_exit_fail_msg("[%s:%d] " fmt " (errno: %s)\n",	\
 			   __func__, __LINE__, ##__VA_ARGS__, strerror(errno))
 
+#define CGROUP_ROOT "/sys/fs/cgroup"
+
 int luo_open_device(void);
 int luo_create_session(int luo_fd, const char *name);
 int luo_retrieve_session(int luo_fd, const char *name);
@@ -46,6 +48,8 @@ int load_test_data(const char *filename, char *buffer, size_t size);
 int create_random_memfd(const char *memfd_name, char *buffer, size_t size);
 int verify_fd_content_read(int fd, const char *expected_data, size_t size);
 int verify_fd_content_mmap(int fd, const char *expected_data, size_t size);
+int cg_read_long(const char *cgroup, const char *file, long *val);
+int cg_write(const char *cgroup, const char *file, const char *val);
 
 typedef void (*luo_test_stage1_fn)(int luo_fd);
 typedef void (*luo_test_stage2_fn)(int luo_fd, int state_session_fd);

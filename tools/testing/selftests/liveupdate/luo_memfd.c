@@ -18,6 +18,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <linux/liveupdate.h>
@@ -57,6 +58,11 @@
 #define HUGETLB_PRESERVED_SESSION_NAME "hugetlb_preserved_session"
 #define HUGETLB_PRESERVED_MEMFD_TOKEN 1
 #define HUGETLB_PRESERVED_BUFFER_SIZE (2UL * SZ_1G)
+
+#define HUGETLB_CGROUP_SESSION_NAME "hugetlb_cgroup_session"
+#define HUGETLB_CGROUP_MEMFD_TOKEN 1
+#define HUGETLB_CGROUP_BUFFER_SIZE SZ_1G
+#define TEST_CGROUP_NAME "luo_test_cg"
 
 static int luo_fd = -1;
 static int stage;
@@ -412,6 +418,103 @@ TEST(hugetlb_preserved_ops)
 	ASSERT_EQ(errno, EPERM);
 
 	close(fd);
+}
+
+/*
+ * Test that hugetlb cgroups are charged correctly when a hugetlb memfd is restored
+ * across live update.
+ */
+TEST(hugetlb_cgroup)
+{
+	struct liveupdate_session_preserve_fd preserve_arg = { .size = sizeof(preserve_arg) };
+	struct liveupdate_session_retrieve_fd retrieve_arg = { .size = sizeof(retrieve_arg) };
+	int fd, session;
+	char *buffer, *mapped_mem;
+	long cg_val;
+	char pid_str[32];
+
+	/* Only run if cgroup v2 with hugetlb controller is available */
+	if (access("/sys/fs/cgroup/cgroup.controllers", F_OK) != 0)
+		SKIP(return, "cgroup v2 not found");
+
+	buffer = malloc(HUGETLB_CGROUP_BUFFER_SIZE);
+	ASSERT_NE(buffer, NULL);
+
+	switch (stage) {
+	case 1:
+		session = luo_create_session(luo_fd, HUGETLB_CGROUP_SESSION_NAME);
+		ASSERT_GE(session, 0);
+
+		fd = memfd_create("hugetlb_cgroup_memfd", MFD_HUGETLB | MFD_HUGE_1GB);
+		if (fd < 0) {
+			free(buffer);
+			SKIP(return, "hugetlb (1GB) not supported: %s", strerror(errno));
+		}
+
+		ASSERT_EQ(ftruncate(fd, HUGETLB_CGROUP_BUFFER_SIZE), 0);
+		mapped_mem = mmap(NULL, HUGETLB_CGROUP_BUFFER_SIZE, PROT_READ | PROT_WRITE,
+				  MAP_SHARED, fd, 0);
+		ASSERT_NE(mapped_mem, MAP_FAILED);
+
+		/* Fault the memory */
+		memset(mapped_mem, 'A', HUGETLB_CGROUP_BUFFER_SIZE);
+
+		preserve_arg.fd = fd;
+		preserve_arg.token = HUGETLB_CGROUP_MEMFD_TOKEN;
+		ASSERT_GE(ioctl(session, LIVEUPDATE_SESSION_PRESERVE_FD, &preserve_arg), 0);
+
+		munmap(mapped_mem, HUGETLB_CGROUP_BUFFER_SIZE);
+		daemonize_and_wait();
+		break;
+	case 2:
+		/* Ensure hugetlb controller is enabled in the root subtree */
+		cg_write("", "cgroup.subtree_control", "+hugetlb");
+
+		/* Create a new test cgroup */
+		mkdir("/sys/fs/cgroup/" TEST_CGROUP_NAME, 0755);
+
+		/* Move self to the new test cgroup */
+		snprintf(pid_str, sizeof(pid_str), "%d", getpid());
+		if (cg_write(TEST_CGROUP_NAME, "cgroup.procs", pid_str) < 0) {
+			free(buffer);
+			rmdir("/sys/fs/cgroup/" TEST_CGROUP_NAME);
+			SKIP(return, "Failed to move to cgroup or hugetlb controller not available");
+		}
+
+		/* Verify initial hugetlb charge is 0 */
+		if (cg_read_long(TEST_CGROUP_NAME, "hugetlb.1GB.current", &cg_val) < 0) {
+			free(buffer);
+			cg_write("", "cgroup.procs", pid_str);
+			rmdir("/sys/fs/cgroup/" TEST_CGROUP_NAME);
+			SKIP(return, "hugetlb.1GB.current not found");
+		}
+		ASSERT_EQ(cg_val, 0);
+
+		session = luo_retrieve_session(luo_fd, HUGETLB_CGROUP_SESSION_NAME);
+		ASSERT_GE(session, 0);
+
+		retrieve_arg.token = HUGETLB_CGROUP_MEMFD_TOKEN;
+		ASSERT_GE(ioctl(session, LIVEUPDATE_SESSION_RETRIEVE_FD, &retrieve_arg), 0);
+		fd = retrieve_arg.fd;
+		ASSERT_GE(fd, 0);
+
+		/* Check that restoring the fd correctly charges the hugetlb cgroup */
+		ASSERT_EQ(cg_read_long(TEST_CGROUP_NAME, "hugetlb.1GB.current", &cg_val), 0);
+		ASSERT_EQ(cg_val, HUGETLB_CGROUP_BUFFER_SIZE);
+
+		ASSERT_EQ(luo_session_finish(session), 0);
+		close(fd);
+
+		/* Move self back to root cgroup */
+		cg_write("", "cgroup.procs", pid_str);
+		rmdir("/sys/fs/cgroup/" TEST_CGROUP_NAME);
+		break;
+	default:
+		TH_LOG("Unknown stage %d\n", stage);
+		ASSERT_FALSE(true);
+	}
+
+	free(buffer);
 }
 
 int main(int argc, char *argv[])

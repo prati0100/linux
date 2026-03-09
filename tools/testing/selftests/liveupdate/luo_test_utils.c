@@ -28,6 +28,8 @@
 #include <sys/vfs.h>
 #include <linux/magic.h>
 
+#include <linux/limits.h>
+
 #include "luo_test_utils.h"
 
 int cwd_is_tmpfs(void)
@@ -211,6 +213,56 @@ int verify_fd_content_mmap(int fd, const char *expected_data, size_t size)
 	ret = memcmp(mapped_mem, expected_data, size) ? 1 : 0;
 	munmap(mapped_mem, size);
 	return ret;
+}
+
+int cg_read_long(const char *cgroup, const char *file, long *val)
+{
+	char path[PATH_MAX];
+	char buf[32];
+	int fd;
+	ssize_t n;
+
+	if (cgroup[0] == '\0')
+		snprintf(path, sizeof(path), "%s/%s", CGROUP_ROOT, file);
+	else
+		snprintf(path, sizeof(path), "%s/%s/%s", CGROUP_ROOT, cgroup, file);
+
+	fd = open(path, O_RDONLY);
+	if (fd < 0)
+		return -errno;
+
+	n = read(fd, buf, sizeof(buf) - 1);
+	close(fd);
+
+	if (n <= 0)
+		return -EIO;
+
+	buf[n] = '\0';
+	*val = strtol(buf, NULL, 10);
+	return 0;
+}
+
+int cg_write(const char *cgroup, const char *file, const char *val)
+{
+	char path[PATH_MAX];
+	int fd;
+	ssize_t n, len = strlen(val);
+
+	if (cgroup[0] == '\0')
+		snprintf(path, sizeof(path), "%s/%s", CGROUP_ROOT, file);
+	else
+		snprintf(path, sizeof(path), "%s/%s/%s", CGROUP_ROOT, cgroup, file);
+
+	fd = open(path, O_WRONLY);
+	if (fd < 0)
+		return -errno;
+
+	n = write(fd, val, len);
+	close(fd);
+
+	if (n != len)
+		return -EIO;
+	return 0;
 }
 
 int luo_open_device(void)
