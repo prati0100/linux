@@ -22,6 +22,7 @@
 
 #include <linux/liveupdate.h>
 #include <linux/sizes.h>
+#include <linux/memfd.h>
 
 #include "../kselftest.h"
 #include "../kselftest_harness.h"
@@ -47,6 +48,11 @@
 #define FALLOCATE_MEMFD_TOKEN 1
 #define FALLOCATE_BUFFER_SIZE SZ_1M
 #define FALLOCATE_DATA_FS_COPY "fallocate_data_fs_copy.bin"
+
+#define HUGETLB_SESSION_NAME "hugetlb_session"
+#define HUGETLB_MEMFD_TOKEN 1
+#define HUGETLB_BUFFER_SIZE SZ_1G
+#define RANDOM_DATA_FILE_HUGETLB "luo_random_data_hugetlb.bin"
 
 static int luo_fd = -1;
 static int stage;
@@ -298,6 +304,66 @@ TEST(fallocate_memfd)
 		break;
 	case 2:
 		fallocate_memfd_stage_2(_metadata);
+		break;
+	default:
+		TH_LOG("Unknown stage %d\n", stage);
+		ASSERT_FALSE(true);
+	}
+}
+
+/*
+ * Test that a hugetlb-backed memfd is preserved across live update.
+ */
+TEST(hugetlb_memfd)
+{
+	struct liveupdate_session_preserve_fd preserve_arg = { .size = sizeof(preserve_arg) };
+	struct liveupdate_session_retrieve_fd retrieve_arg = { .size = sizeof(retrieve_arg) };
+	int fd, session;
+	char *buffer, *mapped_mem;
+
+	buffer = malloc(HUGETLB_BUFFER_SIZE);
+	ASSERT_NE(buffer, NULL);
+
+	switch (stage) {
+	case 1:
+		session = luo_create_session(luo_fd, HUGETLB_SESSION_NAME);
+		ASSERT_GE(session, 0);
+
+		fd = memfd_create("hugetlb_memfd", MFD_HUGETLB | MFD_HUGE_1GB);
+		if (fd < 0)
+			SKIP(return, "hugetlb (1GB) not supported: %s", strerror(errno));
+
+		ASSERT_EQ(ftruncate(fd, HUGETLB_BUFFER_SIZE), 0);
+
+		mapped_mem = mmap(NULL, HUGETLB_BUFFER_SIZE, PROT_READ | PROT_WRITE,
+				  MAP_SHARED, fd, 0);
+		ASSERT_NE(mapped_mem, MAP_FAILED);
+
+		ASSERT_GE(generate_random_data(buffer, HUGETLB_BUFFER_SIZE), 0);
+		memcpy(mapped_mem, buffer, HUGETLB_BUFFER_SIZE);
+		ASSERT_EQ(save_test_data(RANDOM_DATA_FILE_HUGETLB, buffer,
+					 HUGETLB_BUFFER_SIZE), 0);
+
+		preserve_arg.fd = fd;
+		preserve_arg.token = HUGETLB_MEMFD_TOKEN;
+		ASSERT_GE(ioctl(session, LIVEUPDATE_SESSION_PRESERVE_FD, &preserve_arg), 0);
+
+		munmap(mapped_mem, HUGETLB_BUFFER_SIZE);
+		daemonize_and_wait();
+		break;
+	case 2:
+		session = luo_retrieve_session(luo_fd, HUGETLB_SESSION_NAME);
+		ASSERT_GE(session, 0);
+
+		ASSERT_EQ(load_test_data(RANDOM_DATA_FILE_HUGETLB, buffer,
+					 HUGETLB_BUFFER_SIZE), 0);
+
+		retrieve_arg.token = HUGETLB_MEMFD_TOKEN;
+		ASSERT_GE(ioctl(session, LIVEUPDATE_SESSION_RETRIEVE_FD, &retrieve_arg), 0);
+		fd = retrieve_arg.fd;
+		ASSERT_GE(fd, 0);
+
+		ASSERT_EQ(verify_fd_content_mmap(fd, buffer, HUGETLB_BUFFER_SIZE), 0);
 		break;
 	default:
 		TH_LOG("Unknown stage %d\n", stage);
