@@ -54,6 +54,10 @@
 #define HUGETLB_BUFFER_SIZE SZ_1G
 #define RANDOM_DATA_FILE_HUGETLB "luo_random_data_hugetlb.bin"
 
+#define HUGETLB_PRESERVED_SESSION_NAME "hugetlb_preserved_session"
+#define HUGETLB_PRESERVED_MEMFD_TOKEN 1
+#define HUGETLB_PRESERVED_BUFFER_SIZE (2UL * SZ_1G)
+
 static int luo_fd = -1;
 static int stage;
 
@@ -369,6 +373,45 @@ TEST(hugetlb_memfd)
 		TH_LOG("Unknown stage %d\n", stage);
 		ASSERT_FALSE(true);
 	}
+}
+
+/*
+ * Test that a preserved hugetlb-backed memfd can't grow or shrink.
+ */
+TEST(hugetlb_preserved_ops)
+{
+	struct liveupdate_session_preserve_fd preserve_arg = { .size = sizeof(preserve_arg) };
+	int fd, session;
+
+	if (stage != 1)
+		SKIP(return, "test only expected to run on stage 1");
+
+	session = luo_create_session(luo_fd, HUGETLB_PRESERVED_SESSION_NAME);
+	ASSERT_GE(session, 0);
+
+	fd = memfd_create("hugetlb_preserved_memfd", MFD_HUGETLB | MFD_HUGE_1GB);
+	if (fd < 0)
+		SKIP(return, "hugetlb (1GB) not supported: %s", strerror(errno));
+
+	ASSERT_EQ(ftruncate(fd, HUGETLB_PRESERVED_BUFFER_SIZE), 0);
+
+	preserve_arg.fd = fd;
+	preserve_arg.token = HUGETLB_PRESERVED_MEMFD_TOKEN;
+	ASSERT_GE(ioctl(session, LIVEUPDATE_SESSION_PRESERVE_FD, &preserve_arg), 0);
+
+	/* Try to truncate to make sure it fails after preservation. */
+	ASSERT_LT(ftruncate(fd, HUGETLB_PRESERVED_BUFFER_SIZE / 2), 0);
+	ASSERT_EQ(errno, EPERM);
+
+	/* Make sure fallocate fails too. */
+	ASSERT_LT(fallocate(fd, 0, 0, 2UL * SZ_1G), 0);
+	ASSERT_EQ(errno, EPERM);
+
+	ASSERT_LT(fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+			    0, SZ_1G), 0);
+	ASSERT_EQ(errno, EPERM);
+
+	close(fd);
 }
 
 int main(int argc, char *argv[])
