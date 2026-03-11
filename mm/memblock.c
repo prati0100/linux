@@ -115,9 +115,9 @@ unsigned long long max_possible_pfn;
 
 #ifdef CONFIG_MEMBLOCK_KHO_SCRATCH
 /* When set to true, only allocate from MEMBLOCK_KHO_SCRATCH ranges */
-static bool kho_scratch_only;
+static bool kho_scratch_active;
 #else
-#define kho_scratch_only false
+#define kho_scratch_active false
 #endif
 
 static struct memblock_region memblock_memory_init_regions[INIT_MEMBLOCK_MEMORY_REGIONS] __initdata_memblock;
@@ -180,7 +180,7 @@ bool __init_memblock memblock_has_mirror(void)
 static enum memblock_flags __init_memblock choose_memblock_flags(void)
 {
 	/* skip non-scratch memory for kho early boot allocations */
-	if (kho_scratch_only)
+	if (kho_scratch_active)
 		return MEMBLOCK_KHO_SCRATCH;
 
 	return system_has_some_mirror ? MEMBLOCK_MIRROR : MEMBLOCK_NONE;
@@ -244,8 +244,22 @@ __memblock_find_range_bottom_up(phys_addr_t start, phys_addr_t end,
 		this_end = clamp(this_end, start, end);
 
 		cand = round_up(this_start, align);
-		if (cand < this_end && this_end - cand >= size)
-			return cand;
+		if (cand > this_end || this_end - cand < size)
+			continue;
+
+		/*
+		 * If KHO scratch is active but the allocator asked for memory
+		 * outside scratch, make sure it does not overlap with preserved
+		 * memory.
+		 *
+		 * Scratch areas are known to not have any preserved memory so
+		 * no need to check that when allocating only from scratch.
+		 */
+		if (!(flags & MEMBLOCK_KHO_SCRATCH) && kho_scratch_active &&
+		    kho_preserved_overlap(cand, size))
+			continue;
+
+		return cand;
 	}
 
 	return 0;
@@ -283,8 +297,15 @@ __memblock_find_range_top_down(phys_addr_t start, phys_addr_t end,
 			continue;
 
 		cand = round_down(this_end - size, align);
-		if (cand >= this_start)
-			return cand;
+		if (cand < this_start)
+			continue;
+
+		/* See comment in __memblock_find_range_bottom_up(). */
+		if (!(flags & MEMBLOCK_KHO_SCRATCH) && kho_scratch_active &&
+		    kho_preserved_overlap(cand, size))
+			continue;
+
+		return cand;
 	}
 
 	return 0;
@@ -950,14 +971,14 @@ int __init_memblock memblock_physmem_add(phys_addr_t base, phys_addr_t size)
 #endif
 
 #ifdef CONFIG_MEMBLOCK_KHO_SCRATCH
-__init void memblock_set_kho_scratch_only(void)
+__init void memblock_set_kho_scratch_active(void)
 {
-	kho_scratch_only = true;
+	kho_scratch_active = true;
 }
 
-__init void memblock_clear_kho_scratch_only(void)
+__init void memblock_clear_kho_scratch_active(void)
 {
-	kho_scratch_only = false;
+	kho_scratch_active = false;
 }
 
 __init void memmap_init_kho_scratch_pages(void)
@@ -1514,6 +1535,16 @@ again:
 		flags &= ~MEMBLOCK_MIRROR;
 		pr_warn_ratelimited("Could not allocate %pap bytes of mirrored memory\n",
 			&size);
+		goto again;
+	}
+
+	/*
+	 * Try again, but this time try to allocate from outside scratch. This
+	 * will result in walking the KHO radix tree, which is an expensive
+	 * operation, but is better than a failed allocation.
+	 */
+	if (flags & MEMBLOCK_KHO_SCRATCH) {
+		flags &= ~MEMBLOCK_KHO_SCRATCH;
 		goto again;
 	}
 
@@ -2344,7 +2375,7 @@ void __init memblock_free_all(void)
 	free_unused_memmap();
 	reset_all_zones_managed_pages();
 
-	memblock_clear_kho_scratch_only();
+	memblock_clear_kho_scratch_active();
 	pages = free_low_memory_core_early();
 	totalram_pages_add(pages);
 }

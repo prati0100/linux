@@ -25,6 +25,7 @@
 #include <linux/page-isolation.h>
 #include <linux/unaligned.h>
 #include <linux/vmalloc.h>
+#include <linux/range.h>
 
 #include <asm/early_ioremap.h>
 
@@ -52,6 +53,11 @@ union kho_page_info {
 };
 
 static_assert(sizeof(union kho_page_info) == sizeof(((struct page *)0)->private));
+
+struct kho_preserved_overlap_arg {
+	phys_addr_t start;
+	phys_addr_t size;
+};
 
 static bool kho_enable __ro_after_init = IS_ENABLED(CONFIG_KEXEC_HANDOVER_ENABLE_DEFAULT);
 
@@ -1357,6 +1363,38 @@ static int __init kho_mem_retrieve(const void *fdt)
 	return kho_radix_walk_tree(&kho_in.radix_tree, &cb, NULL);
 }
 
+static int kho_preserved_walk_key(phys_addr_t phys, unsigned int order,
+				  void *data)
+{
+	struct kho_preserved_overlap_arg *arg = data;
+
+	return range_overlaps(&DEFINE_RANGE(phys, 1UL << (order + PAGE_SHIFT)),
+			      &DEFINE_RANGE(arg->start, arg->size));
+}
+
+static int kho_preserved_walk_table(phys_addr_t phys, void *data)
+{
+	struct kho_preserved_overlap_arg *arg = data;
+
+	return range_overlaps(&DEFINE_RANGE(phys, PAGE_SIZE),
+			      &DEFINE_RANGE(arg->start, arg->size));
+}
+
+bool __init_memblock kho_preserved_overlap(phys_addr_t start, phys_addr_t size)
+{
+	struct kho_preserved_overlap_arg arg = {
+		.start = start,
+		.size = size,
+	};
+	struct kho_radix_walk_cb cb = {
+		.key = kho_preserved_walk_key,
+		.table = kho_preserved_walk_table,
+	};
+
+	return kho_radix_walk_tree(&kho_in.radix_tree, &cb,
+				   &arg);
+}
+
 static __init int kho_out_fdt_setup(void)
 {
 	struct kho_radix_tree *tree = &kho_out.radix_tree;
@@ -1568,7 +1606,7 @@ void __init kho_populate(phys_addr_t fdt_phys, u64 fdt_len,
 	 * we initialize the page tables which we will need to ingest all
 	 * memory reservations from the previous kernel.
 	 */
-	memblock_set_kho_scratch_only();
+	memblock_set_kho_scratch_active();
 
 	kho_in.fdt_phys = fdt_phys;
 	kho_in.scratch_phys = scratch_phys;
