@@ -61,6 +61,16 @@ struct kho_preserved_overlap_arg {
 
 static bool kho_enable __ro_after_init = IS_ENABLED(CONFIG_KEXEC_HANDOVER_ENABLE_DEFAULT);
 
+struct kho_in {
+	phys_addr_t fdt_phys;
+	phys_addr_t scratch_phys;
+	struct kho_debugfs dbg;
+	struct kho_radix_tree radix_tree;
+};
+
+static struct kho_in kho_in = {
+};
+
 bool kho_is_enabled(void)
 {
 	return kho_enable;
@@ -662,6 +672,21 @@ static phys_addr_t __init scratch_size_node(int nid)
 	return round_up(size, CMA_MIN_ALIGNMENT_BYTES);
 }
 
+static void __init kho_init_scratch_pages(void)
+{
+	if (!IS_ENABLED(CONFIG_DEFERRED_STRUCT_PAGE_INIT))
+		return;
+
+	for (int i = 0; i < kho_scratch_cnt; i++) {
+		unsigned long pfn = PFN_DOWN(kho_scratch[i].addr);
+		unsigned long end_pfn = PFN_UP(kho_scratch[i].addr + kho_scratch[i].size);
+		int nid = early_pfn_to_nid(pfn);
+
+		for (; pfn < end_pfn; pfn++)
+			init_deferred_page(pfn, nid);
+	}
+}
+
 /**
  * kho_reserve_scratch - Reserve a contiguous chunk of memory for kexec
  *
@@ -671,12 +696,16 @@ static phys_addr_t __init scratch_size_node(int nid)
  * active. This CMA region will only be used for movable pages which are not a
  * problem for us during KHO because we can just move them somewhere else.
  */
-static void __init kho_reserve_scratch(void)
+void __init kho_reserve_scratch(void)
 {
 	phys_addr_t addr, size;
 	int nid, i = 0;
 
-	if (!kho_enable)
+	/*
+	 * No need for scratch if KHO is disabled or scratch is already present
+	 * from previous boot.
+	 */
+	if (!kho_enable || kho_in.scratch_phys)
 		return;
 
 	scratch_size_update();
@@ -736,6 +765,8 @@ static void __init kho_reserve_scratch(void)
 		kho_scratch[i].size = size;
 		i++;
 	}
+
+	kho_init_scratch_pages();
 
 	return;
 
@@ -1283,16 +1314,6 @@ void kho_restore_free(void *mem)
 }
 EXPORT_SYMBOL_GPL(kho_restore_free);
 
-struct kho_in {
-	phys_addr_t fdt_phys;
-	phys_addr_t scratch_phys;
-	struct kho_debugfs dbg;
-	struct kho_radix_tree radix_tree;
-};
-
-static struct kho_in kho_in = {
-};
-
 static const void *kho_get_fdt(void)
 {
 	return kho_in.fdt_phys ? phys_to_virt(kho_in.fdt_phys) : NULL;
@@ -1525,16 +1546,15 @@ static void __init kho_release_scratch(void)
 
 void __init kho_memory_init(void)
 {
-	if (kho_in.scratch_phys) {
-		kho_scratch = phys_to_virt(kho_in.scratch_phys);
-		kho_release_scratch();
+	if (!kho_in.scratch_phys)
+		return;
 
-		if (kho_mem_retrieve(kho_get_fdt())) {
-			kho_in.fdt_phys = 0;
-			kho_in.radix_tree.root = NULL;
-		}
-	} else {
-		kho_reserve_scratch();
+	kho_scratch = phys_to_virt(kho_in.scratch_phys);
+	kho_release_scratch();
+
+	if (kho_mem_retrieve(kho_get_fdt())) {
+		kho_in.fdt_phys = 0;
+		kho_in.radix_tree.root = NULL;
 	}
 }
 
