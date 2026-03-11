@@ -34,8 +34,17 @@ struct kho_radix_tree {
 	struct mutex lock; /* protects the tree's structure and root pointer */
 };
 
-typedef int (*kho_radix_tree_walk_callback_t)(phys_addr_t phys,
-					      unsigned int order);
+/**
+ * struct kho_radix_walk_cb - Callbacks for KHO radix tree walk.
+ * @key:      Called on each present key in the radix tree. It receives the
+ *            physical address and order decoded from the key.
+ *
+ * For each callback, a return value of 0 continues the walk and a non-zero
+ * return value is directly returned to the caller.
+ */
+struct kho_radix_walk_cb {
+	int (*key)(phys_addr_t phys, unsigned int order);
+};
 
 #ifdef CONFIG_KEXEC_HANDOVER
 
@@ -46,7 +55,7 @@ void kho_radix_del_page(struct kho_radix_tree *tree, unsigned long pfn,
 			unsigned int order);
 
 int kho_radix_walk_tree(struct kho_radix_tree *tree,
-			kho_radix_tree_walk_callback_t cb);
+			struct kho_radix_walk_cb *cb);
 
 #else  /* #ifdef CONFIG_KEXEC_HANDOVER */
 
@@ -60,7 +69,7 @@ static inline void kho_radix_del_page(struct kho_radix_tree *tree,
 				      unsigned long pfn, unsigned int order) { }
 
 static inline int kho_radix_walk_tree(struct kho_radix_tree *tree,
-				      kho_radix_tree_walk_callback_t cb)
+				      struct kho_radix_walk_cb *cb)
 {
 	return -EOPNOTSUPP;
 }
