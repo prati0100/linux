@@ -307,6 +307,12 @@ static int __kho_radix_walk_tree(struct kho_radix_node *root,
 		if (!root->table[i])
 			continue;
 
+		if (cb->table) {
+			err = cb->table(root->table[i]);
+			if (err)
+				return err;
+		}
+
 		shift = ((level - 1) * KHO_TABLE_SIZE_LOG2) +
 			KHO_BITMAP_SIZE_LOG2;
 		key = start | (i << shift);
@@ -346,10 +352,22 @@ static int __kho_radix_walk_tree(struct kho_radix_node *root,
 int kho_radix_walk_tree(struct kho_radix_tree *tree,
 			struct kho_radix_walk_cb *cb)
 {
+	int err;
+
 	if (WARN_ON_ONCE(!tree->root))
 		return -EINVAL;
 
 	guard(mutex)(&tree->lock);
+
+	/*
+	 * Invoke the table callback for the root table. For descendent tables,
+	 * it will be called as the walk descends to the level.
+	 */
+	if (cb->table) {
+		err = cb->table(virt_to_phys(tree->root));
+		if (err)
+			return err;
+	}
 
 	return __kho_radix_walk_tree(tree->root, KHO_TREE_MAX_DEPTH - 1, 0, cb);
 }
