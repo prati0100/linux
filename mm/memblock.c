@@ -2375,7 +2375,6 @@ void __init memblock_free_all(void)
 	free_unused_memmap();
 	reset_all_zones_managed_pages();
 
-	memblock_clear_kho_scratch_active();
 	pages = free_low_memory_core_early();
 	totalram_pages_add(pages);
 }

@@ -1556,6 +1556,12 @@ void __init kho_memory_init(void)
 		kho_in.fdt_phys = 0;
 		kho_in.radix_tree.root = NULL;
 	}
+
+	/*
+	 * Now that memblock knows about preserved pages, allow allocations from
+	 * everywhere.
+	 */
+	memblock_clear_kho_scratch_active();
 }
 
 void __init kho_populate(phys_addr_t fdt_phys, u64 fdt_len,
