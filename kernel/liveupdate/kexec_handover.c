@@ -57,6 +57,7 @@ static_assert(sizeof(union kho_page_info) == sizeof(((struct page *)0)->private)
 struct kho_preserved_overlap_arg {
 	phys_addr_t start;
 	phys_addr_t size;
+	phys_addr_t overlap_end;
 };
 
 static bool kho_enable __ro_after_init = IS_ENABLED(CONFIG_KEXEC_HANDOVER_ENABLE_DEFAULT);
@@ -1388,32 +1389,49 @@ static int kho_preserved_walk_key(phys_addr_t phys, unsigned int order,
 				  void *data)
 {
 	struct kho_preserved_overlap_arg *arg = data;
+	phys_addr_t size = 1UL << (order + PAGE_SHIFT);
 
-	return range_overlaps(&DEFINE_RANGE(phys, 1UL << (order + PAGE_SHIFT)),
-			      &DEFINE_RANGE(arg->start, arg->size));
+	if (range_overlaps(&DEFINE_RANGE(phys, size),
+			   &DEFINE_RANGE(arg->start, arg->size))) {
+		arg->overlap_end = max_t(phys_addr_t, arg->overlap_end,
+					 phys + size);
+		return 1;
+	}
+
+	return 0;
+
 }
 
 static int kho_preserved_walk_table(phys_addr_t phys, void *data)
 {
 	struct kho_preserved_overlap_arg *arg = data;
 
-	return range_overlaps(&DEFINE_RANGE(phys, PAGE_SIZE),
-			      &DEFINE_RANGE(arg->start, arg->size));
+	if (range_overlaps(&DEFINE_RANGE(phys, PAGE_SIZE),
+			   &DEFINE_RANGE(arg->start, arg->size))) {
+		arg->overlap_end = max_t(phys_addr_t, arg->overlap_end,
+					 phys + PAGE_SIZE);
+		return 1;
+	}
+
+	return 0;
 }
 
-bool __init_memblock kho_preserved_overlap(phys_addr_t start, phys_addr_t size)
+/* TODO: docs */
+phys_addr_t __init_memblock
+kho_preserved_overlap(phys_addr_t start, phys_addr_t size)
 {
 	struct kho_preserved_overlap_arg arg = {
 		.start = start,
 		.size = size,
+		.overlap_end = 0,
 	};
 	struct kho_radix_walk_cb cb = {
 		.key = kho_preserved_walk_key,
 		.table = kho_preserved_walk_table,
 	};
 
-	return kho_radix_walk_tree(&kho_in.radix_tree, &cb,
-				   &arg);
+	kho_radix_walk_tree(&kho_in.radix_tree, &cb, &arg);
+	return arg.overlap_end;
 }
 
 static __init int kho_out_fdt_setup(void)

@@ -42,7 +42,7 @@ void kho_reserve_scratch(void);
 void kho_populate(phys_addr_t fdt_phys, u64 fdt_len, phys_addr_t scratch_phys,
 		  u64 scratch_len);
 
-bool kho_preserved_overlap(phys_addr_t start, phys_addr_t size);
+phys_addr_t kho_preserved_overlap(phys_addr_t start, phys_addr_t size);
 #else
 static inline bool kho_is_enabled(void)
 {
@@ -120,9 +120,9 @@ static inline void kho_populate(phys_addr_t fdt_phys, u64 fdt_len,
 {
 }
 
-bool kho_preserved_overlap(phys_addr_t start, phys_addr_t size)
+phys_addr_t kho_preserved_overlap(phys_addr_t start, phys_addr_t size)
 {
-	return false;
+	return 0;
 }
 #endif /* CONFIG_KEXEC_HANDOVER */
 

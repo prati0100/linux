@@ -2710,6 +2710,18 @@ void __init __weak mem_init(void)
 
 void __init mm_core_init_early(void)
 {
+	phys_addr_t this_start, this_end;
+	u64 i;
+
+	printk("All mem ranges:\n");
+	for_each_mem_range(i, &this_start, &this_end) {
+		printk("[0x%llx-0x%llx]\n", this_start, this_end);
+	}
+
+	printk("All free mem ranges:\n");
+	for_each_free_mem_range(i, NUMA_NO_NODE, 0, &this_start, &this_end, NULL) {
+		printk("[0x%llx-0x%llx]\n", this_start, this_end);
+	}
 	kho_reserve_scratch();
 
 	hugetlb_cma_reserve();

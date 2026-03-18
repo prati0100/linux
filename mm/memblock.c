@@ -244,22 +244,26 @@ __memblock_find_range_bottom_up(phys_addr_t start, phys_addr_t end,
 		this_end = clamp(this_end, start, end);
 
 		cand = round_up(this_start, align);
-		if (cand > this_end || this_end - cand < size)
-			continue;
+		while (cand <= this_end && this_end - cand >= size) {
+			/*
+			 * If KHO scratch is active but the allocator asked for
+			 * memory outside scratch, make sure it does not
+			 * overlap with preserved memory.
+			 *
+			 * Scratch areas are known to not have any preserved
+			 * memory so no need to check that when allocating
+			 * only from scratch.
+			 */
+			if (!(flags & MEMBLOCK_KHO_SCRATCH) && kho_scratch_active) {
+				phys_addr_t overlap = kho_preserved_overlap(cand, size);
 
-		/*
-		 * If KHO scratch is active but the allocator asked for memory
-		 * outside scratch, make sure it does not overlap with preserved
-		 * memory.
-		 *
-		 * Scratch areas are known to not have any preserved memory so
-		 * no need to check that when allocating only from scratch.
-		 */
-		if (!(flags & MEMBLOCK_KHO_SCRATCH) && kho_scratch_active &&
-		    kho_preserved_overlap(cand, size))
-			continue;
-
-		return cand;
+				if (overlap) {
+					cand = round_up(overlap, align);
+					continue;
+				}
+			}
+			return cand;
+		}
 	}
 
 	return 0;
