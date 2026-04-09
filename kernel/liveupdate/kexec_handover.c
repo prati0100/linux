@@ -85,22 +85,21 @@ static struct kho_out kho_out = {
 };
 
 /**
- * kho_encode_radix_key - Encodes a physical address and order into a radix key.
- * @phys: The physical address of the page.
+ * kho_encode_radix_key - Encodes a page frame number and order into a radix key.
+ * @phys: The page frame number of the page.
  * @order: The order of the page.
  *
- * This function combines a page's physical address and its order into a
- * single unsigned long, which is used as a key for all radix tree
- * operations.
+ * This function combines a page's PFN and its order into a single unsigned
+ * long, which is used as a key for all radix tree operations.
  *
  * Return: The encoded unsigned long radix key.
  */
-static unsigned long kho_encode_radix_key(phys_addr_t phys, unsigned int order)
+static unsigned long kho_encode_radix_key(unsigned long pfn, unsigned int order)
 {
 	/* Order bits part */
 	unsigned long h = 1UL << (KHO_ORDER_0_LOG2 - order);
-	/* Shifted physical address part */
-	unsigned long l = phys >> (PAGE_SHIFT + order);
+	/* Shifted page frame number part */
+	unsigned long l = pfn >> order;
 
 	return h | l;
 }
@@ -116,15 +115,15 @@ static unsigned long kho_encode_radix_key(phys_addr_t phys, unsigned int order)
  *
  * Return: The decoded physical address.
  */
-static phys_addr_t kho_decode_radix_key(unsigned long key, unsigned int *order)
+static unsigned long kho_decode_radix_key(unsigned long key, unsigned int *order)
 {
 	unsigned int order_bit = fls64(key);
-	phys_addr_t phys;
+	unsigned long pfn;
 
 	/* order_bit is numbered starting at 1 from fls64 */
 	*order = KHO_ORDER_0_LOG2 - order_bit + 1;
 	/* The order is discarded by the shift */
-	phys = key << (PAGE_SHIFT + *order);
+	pfn = key << *order;
 
 	return phys;
 }
@@ -355,8 +354,7 @@ static void __kho_unpreserve(struct kho_radix_tree *tree,
 	while (pfn < end_pfn) {
 		order = min(count_trailing_zeros(pfn), ilog2(end_pfn - pfn));
 
-		kho_radix_del_key(tree, kho_encode_radix_key(PFN_PHYS(pfn),
-							     order));
+		kho_radix_del_key(tree, kho_encode_radix_key(pfn, order));
 
 		pfn += 1 << order;
 	}
@@ -469,17 +467,17 @@ static int __init kho_preserved_memory_reserve(unsigned long key)
 	union kho_page_info info;
 	struct page *page;
 	unsigned int order;
-	phys_addr_t phys;
+	unsigned long pfn;
 	u64 sz;
 
-	phys = kho_decode_radix_key(key, &order);
+	pfn = kho_decode_radix_key(key, &order);
 
 	sz = 1 << (order + PAGE_SHIFT);
-	page = phys_to_page(phys);
+	page = pfn_to_page(pfn);
 
 	/* Reserve the memory preserved in KHO in memblock */
-	memblock_reserve(phys, sz);
-	memblock_reserved_mark_noinit(phys, sz);
+	memblock_reserve(PFN_PHYS(pfn), sz);
+	memblock_reserved_mark_noinit(PFN_PHYS(pfn), sz);
 	info.magic = KHO_PAGE_MAGIC;
 	info.order = order;
 	page->private = info.page_private;
@@ -827,8 +825,7 @@ int kho_preserve_folio(struct folio *folio)
 	if (WARN_ON(kho_scratch_overlap(pfn << PAGE_SHIFT, PAGE_SIZE << order)))
 		return -EINVAL;
 
-	return kho_radix_add_key(tree, kho_encode_radix_key(PFN_PHYS(pfn),
-							    order));
+	return kho_radix_add_key(tree, kho_encode_radix_key(pfn, order));
 }
 EXPORT_SYMBOL_GPL(kho_preserve_folio);
 
@@ -846,7 +843,7 @@ void kho_unpreserve_folio(struct folio *folio)
 	const unsigned long pfn = folio_pfn(folio);
 	const unsigned int order = folio_order(folio);
 
-	kho_radix_del_key(tree, kho_encode_radix_key(PFN_PHYS(pfn), order));
+	kho_radix_del_key(tree, kho_encode_radix_key(pfn, order));
 }
 EXPORT_SYMBOL_GPL(kho_unpreserve_folio);
 
@@ -886,8 +883,7 @@ int kho_preserve_pages(struct page *page, unsigned long nr_pages)
 		while (pfn_to_nid(pfn) != pfn_to_nid(pfn + (1UL << order) - 1))
 			order--;
 
-		err = kho_radix_add_key(tree, kho_encode_radix_key(PFN_PHYS(pfn),
-								   order));
+		err = kho_radix_add_key(tree, kho_encode_radix_key(pfn, order));
 		if (err) {
 			failed_pfn = pfn;
 			break;
