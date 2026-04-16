@@ -27,6 +27,7 @@
 #include <linux/page-isolation.h>
 #include <linux/unaligned.h>
 #include <linux/vmalloc.h>
+#include <linux/find.h>
 
 #include <asm/early_ioremap.h>
 
@@ -1606,6 +1607,143 @@ static void __init kho_release_scratch(void)
 			init_pageblock_migratetype(pfn_to_page(pfn),
 						   MIGRATE_CMA, false);
 	}
+}
+
+#define KHO_EXT_ORDER		PUD_ORDER
+#define KHO_EXT_SHIFT		PUD_SHIFT
+#define KHO_EXT_TABLE_SIZE	PAGE_SIZE
+#define KHO_EXT_TABLE_ENTRIES	(PAGE_SIZE / sizeof(unsigned long *))
+#define KHO_EXT_TABLE_SHIFT	(KHO_EXT_SHIFT + PAGE_SHIFT + 3)
+#define KHO_EXT_BITMAP_SIZE	PAGE_SIZE
+#define KHO_EXT_BITMAP_NBITS	(KHO_EXT_BITMAP_SIZE * BITS_PER_BYTE)
+#define KHO_EXT_BITMAP_MASK	((1UL << KHO_EXT_TABLE_SHIFT) - 1)
+
+/*
+ * TODO: Add a static assert on MAX_POSSIBLE_PHYSMEM_BITS and make sure they are
+ * all supported.
+ */
+
+static inline phys_addr_t kho_ext_table_addr(unsigned long idx)
+{
+	return idx << KHO_EXT_TABLE_SHIFT;
+}
+
+static inline unsigned long kho_ext_table_idx(phys_addr_t phys)
+{
+	return phys >> KHO_EXT_TABLE_SHIFT;
+}
+
+static inline unsigned long kho_ext_bitmap_idx(phys_addr_t phys)
+{
+	return (phys & KHO_EXT_BITMAP_MASK) >> KHO_EXT_SHIFT;
+}
+
+static __init int kho_ext_mark_busy_one(unsigned long **table, phys_addr_t phys)
+{
+	unsigned long idx = kho_ext_table_idx(phys);
+	unsigned long *bitmap = table[idx];
+
+	if (unlikely(!bitmap)) {
+		bitmap = memblock_alloc(KHO_EXT_BITMAP_SIZE, PAGE_SIZE);
+		if (!bitmap)
+			return -ENOMEM;
+
+		table[idx] = bitmap;
+	}
+
+	bitmap_set(bitmap, kho_ext_bitmap_idx(phys), 1);
+	return 0;
+}
+
+static int __init kho_ext_walk_key(phys_addr_t phys, unsigned int order,
+				   void *data)
+{
+	unsigned long **table = data, size = (1UL << order);
+	phys_addr_t start = ALIGN_DOWN(phys, (1UL << KHO_EXT_SHIFT));
+	phys_addr_t end = phys + size;
+	int err;
+
+	while (start < end) {
+		err = kho_ext_mark_busy_one(table, start);
+		if (err)
+			return err;
+
+		start += (1UL << KHO_EXT_SHIFT);
+	}
+
+	return 0;
+}
+
+static int __init kho_ext_walk_table(phys_addr_t phys, void *data)
+{
+	unsigned long **table = data;
+
+	return kho_ext_mark_busy_one(table, phys);
+}
+
+static int __init kho_ext_mark_scratch(unsigned long **table)
+{
+	phys_addr_t prev_end = 0;
+	int err;
+
+	for (unsigned long i = 0; i < KHO_EXT_TABLE_ENTRIES; i++) {
+		phys_addr_t addr;
+		unsigned long start, end;
+
+		if (!table[i])
+			continue;
+
+		addr = kho_ext_table_addr(i);
+		if (addr > prev_end) {
+			err = memblock_mark_kho_scratch(prev_end, addr - prev_end);
+			if (err)
+				return err;
+		}
+
+		for_each_clear_bitrange(start, end, table[i], KHO_EXT_BITMAP_SIZE) {
+			err = memblock_mark_kho_scratch(addr + (start << KHO_EXT_SHIFT),
+							(end - start) << KHO_EXT_SHIFT);
+			if (err)
+				return err;
+		}
+
+		prev_end = addr + (1UL << KHO_EXT_TABLE_SHIFT);
+	}
+
+	return 0;
+}
+
+int __init kho_extend_scratch(void)
+{
+	struct kho_radix_walk_cb cb = {
+		.key = kho_ext_walk_key,
+		.table = kho_ext_walk_table,
+	};
+	unsigned long **table;
+	int err = 0;
+
+	if (!is_kho_boot())
+		return 0;
+
+	table = memblock_alloc(KHO_EXT_TABLE_SIZE, PAGE_SIZE);
+	if (!table)
+		return -ENOMEM;
+
+	memset(table, 0, KHO_EXT_TABLE_SIZE);
+
+	err = kho_radix_walk_tree(&kho_in.radix_tree, &cb, table);
+	if (err)
+		goto out;
+
+	err = kho_ext_mark_scratch(table);
+
+out:
+	for (unsigned long i = 0; i < KHO_EXT_TABLE_ENTRIES; i++) {
+		if (table[i])
+			memblock_free(table, KHO_EXT_BITMAP_SIZE);
+	}
+	memblock_free(table, KHO_EXT_TABLE_SIZE);
+	return err;
 }
 
 void __init kho_memory_init(void)
