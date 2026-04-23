@@ -48,6 +48,8 @@
 #define FALLOCATE_BUFFER_SIZE SZ_1M
 #define FALLOCATE_DATA_FS_COPY "fallocate_data_fs_copy.bin"
 
+#define SEALS_MEMFD_TOKEN 1
+
 static int luo_fd = -1;
 static int stage;
 
@@ -302,6 +304,50 @@ TEST(fallocate_memfd)
 	default:
 		TH_LOG("Unknown stage %d\n", stage);
 		ASSERT_FALSE(true);
+	}
+}
+
+/* Add some seals to a memfd and make sure they are preserved. */
+TEST(seals)
+{
+	int memfd, session;
+	int seals = F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_WRITE | F_SEAL_SEAL;
+	struct liveupdate_session_preserve_fd arg = { .size = sizeof(arg) };
+
+	switch (stage) {
+	case 1:
+		int err;
+
+		session = luo_create_session(luo_fd, "seals");
+		ASSERT_GE(session, 0);
+
+		memfd = memfd_create("test", MFD_ALLOW_SEALING);
+		ASSERT_GE(memfd, 0);
+		err = fcntl(memfd, F_ADD_SEALS, seals);
+		ASSERT_GE(err, 0);
+
+		arg.fd = memfd;
+		arg.token = SEALS_MEMFD_TOKEN;
+		ASSERT_GE(ioctl(session, LIVEUPDATE_SESSION_PRESERVE_FD, &arg), 0);
+		daemonize_and_wait();
+		break;
+	case 2:
+		struct liveupdate_session_retrieve_fd arg = { .size = sizeof(arg) };
+
+		session = luo_retrieve_session(luo_fd, "seals");
+		ASSERT_GE(session, 0);
+
+		arg.token = SEALS_MEMFD_TOKEN;
+		ASSERT_GE(ioctl(session, LIVEUPDATE_SESSION_RETRIEVE_FD, &arg), 0);
+
+		memfd = arg.fd;
+		ASSERT_GE(memfd, 0);
+		ASSERT_EQ(fcntl(memfd, F_GET_SEALS), seals);
+		break;
+	default:
+		TH_LOG("Unknown stage %d\n", stage);
+		ASSERT_FALSE(true);
+		break;
 	}
 }
 
