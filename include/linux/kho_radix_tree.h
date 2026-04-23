@@ -32,6 +32,11 @@ struct kho_radix_node;
 struct kho_radix_tree {
 	struct kho_radix_node *root;
 	struct mutex lock; /* protects the tree's structure and root pointer */
+
+	struct {
+		unsigned long nr_nodes;
+		unsigned long nr_keys;
+	} stats;
 };
 
 /**

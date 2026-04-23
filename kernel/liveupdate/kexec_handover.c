@@ -17,7 +17,6 @@
 #include <linux/kasan.h>
 #include <linux/kexec.h>
 #include <linux/kexec_handover.h>
-#include <linux/kho_radix_tree.h>
 #include <linux/utsname.h>
 #include <linux/kho/abi/kexec_handover.h>
 #include <linux/kho/abi/kexec_metadata.h>
@@ -69,15 +68,7 @@ static int __init kho_parse_enable(char *p)
 }
 early_param("kho", kho_parse_enable);
 
-struct kho_out {
-	void *fdt;
-	struct mutex lock; /* protects KHO FDT */
-
-	struct kho_radix_tree radix_tree;
-	struct kho_debugfs dbg;
-};
-
-static struct kho_out kho_out = {
+struct kho_out kho_out = {
 	.lock = __MUTEX_INITIALIZER(kho_out.lock),
 	.radix_tree = {
 		.lock = __MUTEX_INITIALIZER(kho_out.radix_tree.lock),
@@ -160,7 +151,7 @@ static unsigned long kho_radix_get_table_index(unsigned long key,
 	return (key >> s) % (1 << KHO_TABLE_SIZE_LOG2);
 }
 
-static void __ref *kho_radix_alloc_node(void)
+static void __ref *kho_radix_alloc_node(struct kho_radix_tree *tree)
 {
 	struct kho_radix_node *node;
 
@@ -169,15 +160,21 @@ static void __ref *kho_radix_alloc_node(void)
 	else
 		node = memblock_alloc(PAGE_SIZE, PAGE_SIZE);
 
+	if (node)
+		tree->stats.nr_nodes++;
+
 	return node;
 }
 
-static void __ref kho_radix_free_node(struct kho_radix_node *node)
+static void __ref kho_radix_free_node(struct kho_radix_tree *tree,
+				      struct kho_radix_node *node)
 {
 	if (slab_is_available())
 		free_page((unsigned long)node);
 	else
 		memblock_free(node, PAGE_SIZE);
+
+	tree->stats.nr_nodes--;
 }
 
 /**
@@ -228,7 +225,7 @@ int kho_radix_add_key(struct kho_radix_tree *tree, unsigned long key)
 		}
 
 		/* Next node is empty, create a new node for it */
-		new_node = kho_radix_alloc_node();
+		new_node = kho_radix_alloc_node(tree);
 		if (!new_node) {
 			err = -ENOMEM;
 			goto err_free_nodes;
@@ -254,12 +251,16 @@ int kho_radix_add_key(struct kho_radix_tree *tree, unsigned long key)
 	leaf = (struct kho_radix_leaf *)node;
 	__set_bit(idx, leaf->bitmap);
 
+	tree->stats.nr_keys++;
+
 	return 0;
 
 err_free_nodes:
 	for (i = KHO_TREE_MAX_DEPTH - 1; i > 0; i--) {
-		if (intermediate_nodes[i])
-			kho_radix_free_node(intermediate_nodes[i]);
+		if (intermediate_nodes[i]) {
+			kho_radix_free_node(tree, intermediate_nodes[i]);
+			tree->stats.nr_nodes--;
+		}
 	}
 	if (anchor_node)
 		anchor_node->table[anchor_idx] = 0;
@@ -312,26 +313,30 @@ void kho_radix_del_key(struct kho_radix_tree *tree, unsigned long key)
 	leaf = (struct kho_radix_leaf *)node;
 	idx = kho_radix_get_bitmap_index(key);
 	__clear_bit(idx, leaf->bitmap);
+
+	tree->stats.nr_keys--;
 }
 EXPORT_SYMBOL_GPL(kho_radix_del_key);
 
-static void __kho_radix_destroy_tree(struct kho_radix_node *root,
+static void __kho_radix_destroy_tree(struct kho_radix_tree *tree,
+				     struct kho_radix_node *root,
 				     unsigned int level)
 {
 	unsigned long i;
 
 	if (level == 0) {
-		kho_radix_free_node(root);
+		kho_radix_free_node(tree, root);
 		return;
 	}
 
 	for (i = 0; i < PAGE_SIZE / sizeof(phys_addr_t); i++) {
 		if (root->table[i])
-			__kho_radix_destroy_tree(phys_to_virt(root->table[i]),
+			__kho_radix_destroy_tree(tree,
+						 phys_to_virt(root->table[i]),
 						 level - 1);
 	}
 
-	kho_radix_free_node(root);
+	kho_radix_free_node(tree, root);
 }
 
 /**
@@ -352,7 +357,7 @@ int kho_radix_init_tree(struct kho_radix_tree *tree, struct kho_radix_node *root
 		return 0;
 
 	if (!root)
-		root = kho_radix_alloc_node();
+		root = kho_radix_alloc_node(tree);
 	if (!root)
 		return -ENOMEM;
 
@@ -373,7 +378,7 @@ void kho_radix_destroy_tree(struct kho_radix_tree *tree)
 	if (!tree->root)
 		return;
 
-	__kho_radix_destroy_tree(tree->root, KHO_TREE_MAX_DEPTH - 1);
+	__kho_radix_destroy_tree(tree, tree->root, KHO_TREE_MAX_DEPTH - 1);
 	tree->root = NULL;
 }
 EXPORT_SYMBOL_GPL(kho_radix_destroy_tree);
@@ -1121,13 +1126,19 @@ int kho_preserve_folio(struct folio *folio)
 	struct kho_radix_tree *tree = &kho_out.radix_tree;
 	const unsigned long pfn = folio_pfn(folio);
 	const unsigned int order = folio_order(folio);
+	int err;
 
 	if (IS_ENABLED(CONFIG_KEXEC_HANDOVER_DEBUG) &&
 	    WARN_ON(kho_scratch_overlap(pfn << PAGE_SHIFT, PAGE_SIZE << order)))
 		return -EINVAL;
 
-	return kho_radix_add_key(tree, kho_encode_radix_key(PFN_PHYS(pfn),
-							    order));
+	err = kho_radix_add_key(tree, kho_encode_radix_key(PFN_PHYS(pfn), order));
+	if (err)
+		return err;
+
+	kho_out.stats.mem_preserved += folio_size(folio);
+	kho_out.stats.order_preservations[folio_order(folio)]++;
+	return 0;
 }
 EXPORT_SYMBOL_GPL(kho_preserve_folio);
 
@@ -1146,6 +1157,9 @@ void kho_unpreserve_folio(struct folio *folio)
 	const unsigned int order = folio_order(folio);
 
 	kho_radix_del_key(tree, kho_encode_radix_key(PFN_PHYS(pfn), order));
+
+	kho_out.stats.mem_preserved -= folio_size(folio);
+	kho_out.stats.order_preservations[folio_order(folio)]--;
 }
 EXPORT_SYMBOL_GPL(kho_unpreserve_folio);
 
@@ -1177,6 +1191,8 @@ static void __kho_unpreserve(struct kho_radix_tree *tree,
 		kho_radix_del_key(tree, kho_encode_radix_key(PFN_PHYS(pfn),
 							     order));
 
+		kho_out.stats.mem_preserved -= PAGE_SIZE << order;
+		kho_out.stats.order_preservations[order]--;
 		pfn += 1 << order;
 	}
 }
@@ -1215,6 +1231,9 @@ int kho_preserve_pages(struct page *page, unsigned long nr_pages)
 			failed_pfn = pfn;
 			break;
 		}
+
+		kho_out.stats.mem_preserved += PAGE_SIZE << order;
+		kho_out.stats.order_preservations[order]++;
 
 		pfn += 1 << order;
 	}

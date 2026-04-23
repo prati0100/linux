@@ -95,6 +95,26 @@ static int scratch_len_show(struct seq_file *m, void *v)
 }
 DEFINE_SHOW_ATTRIBUTE(scratch_len);
 
+static int radix_tree_stats_show(struct seq_file *m, void *v)
+{
+	struct kho_radix_tree *tree = &kho_out.radix_tree;
+
+	seq_printf(m, "radix_nodes:       0x%lx\n", tree->stats.nr_nodes);
+	seq_printf(m, "nr_preservations:  0x%lx\n", tree->stats.nr_keys);
+	seq_printf(m, "mem_preserved:     0x%lx\n", kho_out.stats.mem_preserved);
+
+	seq_printf(m, "\nper order preservations:\n");
+	for (int i = 0; i < KHO_MAX_ORDER; i++) {
+		unsigned long nr = kho_out.stats.order_preservations[i];
+
+		if (nr)
+			seq_printf(m, "  order %2d:  0x%lx\n", i, nr);
+	}
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(radix_tree_stats);
+
 __init void kho_in_debugfs_init(struct kho_debugfs *dbg, const void *fdt)
 {
 	struct dentry *dir, *sub_fdt_dir;
@@ -193,6 +213,11 @@ __init int kho_out_debugfs_init(struct kho_debugfs *dbg)
 
 	f = debugfs_create_file("scratch_len", 0400, dir, NULL,
 				&scratch_len_fops);
+	if (IS_ERR(f))
+		goto err_rmdir;
+
+	f = debugfs_create_file("radix_tree_stats", 0400, dir, NULL,
+				&radix_tree_stats_fops);
 	if (IS_ERR(f))
 		goto err_rmdir;
 

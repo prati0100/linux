@@ -5,6 +5,10 @@
 #include <linux/kexec_handover.h>
 #include <linux/list.h>
 #include <linux/types.h>
+#include <linux/kho_radix_tree.h>
+#include <asm/page.h>
+
+#define KHO_MAX_ORDER (64 - PAGE_SHIFT)
 
 #ifdef CONFIG_KEXEC_HANDOVER_DEBUGFS
 #include <linux/debugfs.h>
@@ -21,6 +25,21 @@ struct kho_debugfs {};
 
 extern struct kho_scratch *kho_scratch;
 extern unsigned int kho_scratch_cnt;
+
+struct kho_out {
+	void *fdt;
+	struct mutex lock; /* protects KHO FDT */
+
+	struct kho_radix_tree radix_tree;
+	struct kho_debugfs dbg;
+
+	struct {
+		unsigned long mem_preserved;
+		unsigned long order_preservations[KHO_MAX_ORDER];
+	} stats;
+};
+
+extern struct kho_out kho_out;
 
 #ifdef CONFIG_KEXEC_HANDOVER_DEBUGFS
 int kho_debugfs_init(void);
