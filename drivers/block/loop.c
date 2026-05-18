@@ -35,6 +35,8 @@
 #include <linux/uaccess.h>
 #include <linux/blk-mq.h>
 #include <linux/spinlock.h>
+#include <linux/dax.h>
+#include <linux/shmem_fs.h>
 #include <uapi/linux/loop.h>
 
 /* Possible states of device */
@@ -74,6 +76,7 @@ struct loop_device {
 	struct gendisk		*lo_disk;
 	struct mutex		lo_mutex;
 	bool			idr_visible;
+	struct dax_device	*dax_dev;
 };
 
 struct loop_cmd {
@@ -965,11 +968,13 @@ static void loop_update_limits(struct loop_device *lo, struct queue_limits *lim,
 	lim->logical_block_size = bsize;
 	lim->physical_block_size = bsize;
 	lim->io_min = bsize;
-	lim->features &= ~(BLK_FEAT_WRITE_CACHE | BLK_FEAT_ROTATIONAL);
+	lim->features &= ~(BLK_FEAT_WRITE_CACHE | BLK_FEAT_ROTATIONAL | BLK_FEAT_DAX);
 	if (file->f_op->fsync && !(lo->lo_flags & LO_FLAGS_READ_ONLY))
 		lim->features |= BLK_FEAT_WRITE_CACHE;
 	if (backing_bdev && bdev_rot(backing_bdev))
 		lim->features |= BLK_FEAT_ROTATIONAL;
+	if (shmem_file(file))
+		lim->features |= BLK_FEAT_DAX;
 	lim->max_hw_discard_sectors = max_discard_sectors;
 	lim->max_write_zeroes_sectors = max_discard_sectors;
 	if (max_discard_sectors)
@@ -977,6 +982,8 @@ static void loop_update_limits(struct loop_device *lo, struct queue_limits *lim,
 	else
 		lim->discard_granularity = 0;
 }
+
+static const struct dax_operations loop_dax_ops;
 
 static int loop_configure(struct loop_device *lo, blk_mode_t mode,
 			  struct block_device *bdev,
@@ -1078,6 +1085,25 @@ static int loop_configure(struct loop_device *lo, blk_mode_t mode,
 	size = lo_calculate_size(lo, file);
 	loop_set_size(lo, size);
 
+	if (shmem_file(file)) {
+		struct dax_device *dax_dev;
+
+		dax_dev = alloc_dax(lo, &loop_dax_ops);
+		if (IS_ERR(dax_dev)) {
+			error = PTR_ERR(dax_dev);
+			goto out_unlock;
+		}
+		set_dax_nocache(dax_dev);
+		set_dax_nomc(dax_dev);
+		if (dax_add_host(dax_dev, lo->lo_disk)) {
+			error = -ENOMEM;
+			kill_dax(dax_dev);
+			put_dax(dax_dev);
+			goto out_unlock;
+		}
+		lo->dax_dev = dax_dev;
+	}
+
 	/* Order wrt reading lo_state in loop_validate_file(). */
 	wmb();
 
@@ -1139,6 +1165,12 @@ static void __loop_clr_fd(struct loop_device *lo)
 	lim.physical_block_size = SECTOR_SIZE;
 	lim.io_min = SECTOR_SIZE;
 	queue_limits_commit_update(lo->lo_queue, &lim);
+
+	if (lo->dax_dev) {
+		kill_dax(lo->dax_dev);
+		put_dax(lo->dax_dev);
+		lo->dax_dev = NULL;
+	}
 
 	invalidate_disk(lo->lo_disk);
 	loop_sysfs_exit(lo);
@@ -1762,6 +1794,70 @@ static void lo_free_disk(struct gendisk *disk)
 	mutex_destroy(&lo->lo_mutex);
 	kfree(lo);
 }
+
+static long loop_dax_direct_access(struct dax_device *dax_dev, pgoff_t pgoff,
+		long nr_pages, enum dax_access_mode mode, void **kaddr,
+		unsigned long *pfn)
+{
+	struct loop_device *lo = dax_get_private(dax_dev);
+	struct file *file = lo->lo_backing_file;
+	struct address_space *mapping;
+	struct page *page;
+	pgoff_t offset;
+
+	if (!file)
+		return -ENODEV;
+
+	mapping = file->f_mapping;
+	offset = (lo->lo_offset >> PAGE_SHIFT) + pgoff;
+
+	page = shmem_read_mapping_page(mapping, offset);
+	if (IS_ERR(page))
+		return PTR_ERR(page);
+
+	if (kaddr)
+		*kaddr = page_address(page);
+	if (pfn)
+		*pfn = page_to_pfn(page);
+
+	/* We intentionally do not put the page to keep it pinned in memory.
+	 * This prevents it from being swapped out.
+	 */
+
+	return 1;
+}
+
+static int loop_dax_zero_page_range(struct dax_device *dax_dev, pgoff_t pgoff,
+		size_t nr_pages)
+{
+	struct loop_device *lo = dax_get_private(dax_dev);
+	struct file *file = lo->lo_backing_file;
+	struct address_space *mapping;
+	struct page *page;
+	pgoff_t offset;
+	size_t i;
+
+	if (!file)
+		return -ENODEV;
+
+	mapping = file->f_mapping;
+
+	for (i = 0; i < nr_pages; i++) {
+		offset = (lo->lo_offset >> PAGE_SHIFT) + pgoff + i;
+		page = shmem_read_mapping_page(mapping, offset);
+		if (IS_ERR(page))
+			return PTR_ERR(page);
+		clear_highpage(page);
+		put_page(page);
+	}
+
+	return 0;
+}
+
+static const struct dax_operations loop_dax_ops = {
+	.direct_access = loop_dax_direct_access,
+	.zero_page_range = loop_dax_zero_page_range,
+};
 
 static const struct block_device_operations lo_fops = {
 	.owner =	THIS_MODULE,
