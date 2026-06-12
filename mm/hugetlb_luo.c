@@ -16,6 +16,8 @@
 #include <linux/vmalloc.h>
 #include <linux/kho/abi/hugetlb.h>
 #include <linux/spinlock.h>
+#include <linux/memfd.h>
+#include <uapi/linux/memfd.h>
 
 #include "hugetlb_internal.h"
 #include "hugetlb_vmemmap.h"
@@ -396,7 +398,12 @@ static void hugemfd_finish(struct liveupdate_file_op_args *args)
 	LIST_HEAD(folio_list);
 	struct hstate *h;
 
-	if (args->retrieved)
+	/*
+	 * If retrieve was successful, nothing to do. If it failed, retrieve()
+	 * already cleaned up everything it could. So nothing to do there
+	 * either. Only need to clean up when retrieve was not called.
+	 */
+	if (args->retrieve_status)
 		return;
 
 	folios_ser = kho_restore_vmalloc(&memfd_ser->folios);
@@ -620,13 +627,15 @@ err_free_folios_ser:
 static int hugemfd_retrieve(struct liveupdate_file_op_args *args)
 {
 	struct hugemfd_ser *memfd_ser;
+	unsigned int flags;
 	struct file *file;
 	int err;
 
 	memfd_ser = phys_to_virt(args->serialized_data);
 
-	file = hugetlb_file_setup("", 0, VM_NORESERVE, HUGETLB_ANONHUGE_INODE,
-				  memfd_ser->order + PAGE_SHIFT);
+	flags = MFD_HUGETLB;
+	flags |= ((unsigned int)memfd_ser->order + PAGE_SHIFT) << MFD_HUGE_SHIFT;
+	file = memfd_alloc_file("", flags);
 	if (IS_ERR(file)) {
 		err = PTR_ERR(file);
 		goto err_free_memfd_ser;
