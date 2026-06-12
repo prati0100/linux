@@ -122,17 +122,10 @@ static int __init luo_early_startup(void)
 	pr_info("Retrieved live update data, liveupdate number: %lld\n",
 		luo_global.liveupdate_num);
 
-	err = luo_session_setup_incoming(luo_ser->sessions_pa);
-	if (err)
-		goto out_free_ser;
-
+	luo_session_setup_incoming(&luo_ser->sessions_pa);
 	luo_flb_setup_incoming(luo_ser->flbs_pa);
 
-	err = 0;
-
-out_free_ser:
-	kho_restore_free(luo_ser);
-	return err;
+	return 0;
 }
 
 /*

@@ -532,20 +532,15 @@ void __init luo_session_setup_outgoing(u64 *sessions_pa)
 	luo_session_global.outgoing.active = true;
 }
 
-int __init luo_session_setup_incoming(u64 sessions_pa)
+void __init luo_session_setup_incoming(u64 *sessions_pa)
 {
 	struct luo_session_header *sh = &luo_session_global.incoming;
-	int err;
 
-	if (!sessions_pa)
-		return 0;
+	if (!*sessions_pa)
+		return;
 
-	err = kho_block_set_restore(&sh->block_set, sessions_pa);
-	if (err)
-		return err;
-
+	sh->sessions_pa = sessions_pa;
 	sh->active = true;
-	return 0;
 }
 
 static int luo_session_deserialize_one(struct luo_session_header *sh,
@@ -599,6 +594,10 @@ int luo_session_deserialize(void)
 	if (!sh->active)
 		return 0;
 
+	err = kho_block_set_restore(&sh->block_set, *sh->sessions_pa);
+	if (err)
+		goto save_err;
+
 	/*
 	 * Note on error handling:
 	 *
@@ -618,15 +617,16 @@ int luo_session_deserialize(void)
 	while ((ser = kho_block_set_it_read_entry(&it))) {
 		err = luo_session_deserialize_one(sh, ser);
 		if (err)
-			goto save_err;
+			goto destroy_block_set;
 	}
 
 	kho_block_set_destroy(&sh->block_set);
 
 	return 0;
 
-save_err:
+destroy_block_set:
 	kho_block_set_destroy(&sh->block_set);
+save_err:
 	saved_err = err;
 	return err;
 }
