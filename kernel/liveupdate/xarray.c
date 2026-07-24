@@ -24,7 +24,7 @@ static unsigned int kho_xa_node_idx(u64 key, unsigned int level)
 
 static struct kho_xarray_node *kho_xa_alloc_node(void)
 {
-	struct folio *folio = folio_alloc(GFP_KERNEL, 0);
+	struct folio *folio = folio_alloc(GFP_KERNEL | __GFP_ZERO, 0);
 	unsigned long *count;
 
 	if (!folio)
@@ -69,7 +69,7 @@ static void kho_xa_set_leaf(struct kho_xarray_leaf *leaf, u64 value,
 	(*count)++;
 }
 
-static void kho_xa_clear_node(struct kho_xarray_node *node, unsigned int idx)
+static void __maybe_unused kho_xa_clear_node(struct kho_xarray_node *node, unsigned int idx)
 {
 	struct folio *folio = virt_to_folio(node);
 	unsigned long *count = folio_get_private(folio);
@@ -78,7 +78,7 @@ static void kho_xa_clear_node(struct kho_xarray_node *node, unsigned int idx)
 	(*count)--;
 }
 
-static void kho_xa_cleanup_nodes(struct kho_xarray_node *root, u64 key)
+static void __maybe_unused kho_xa_cleanup_nodes(struct kho_xarray_node *root, u64 key)
 {
 	struct kho_xarray_node *nodes[KHO_XARRAY_DEPTH] = { NULL };
 	struct kho_xarray_node *node = root;
@@ -98,16 +98,15 @@ static void kho_xa_cleanup_nodes(struct kho_xarray_node *root, u64 key)
 	/* If the loop exits with a valid node, it must be the leaf */
 	if (node)
 		leaf = (struct kho_xarray_leaf *)node;
+	(void)leaf;
 
 	for (unsigned int i = KHO_XARRAY_DEPTH - 1; i > 0; i--) {
-		unsigned long *count;
-
 		if (!nodes[i])
 			continue;
-
 	}
 }
 
+/* TODO: Handle value == 0. */
 int kho_xa_set(struct kho_xarray *kxa, u64 key, u64 value)
 {
 	struct kho_xarray_node *root = KHOSER_LOAD_PTR(kxa->root), *node;
@@ -156,8 +155,10 @@ int kho_xa_set(struct kho_xarray *kxa, u64 key, u64 value)
 	/* node now points to the leaf node. */
 	leaf = (struct kho_xarray_leaf *)node;
 	idx = kho_xa_node_idx(key, 0);
-	/* TODO: set_leaf()? */
-	leaf->values[idx] = value;
+	if (!leaf->values[idx])
+		kho_xa_set_leaf(leaf, value, idx);
+	else
+		leaf->values[idx] = value;
 
 	return 0;
 
@@ -193,10 +194,30 @@ void kho_xa_clear(struct kho_xarray *kxa, u64 key)
 	/* TODO: Free nodes. */
 }
 
-static u64 __kho_xa_next_node(struct kho_xarray_node *node, u64 *key, u64 *value,
-			      unsigned int level)
+static bool __kho_xa_next_leaf(struct kho_xarray_leaf *leaf, u64 *key,
+			       u64 *value)
+{
+	unsigned int i, idx;
+
+	idx = kho_xa_node_idx(*key, 0);
+
+	for (i = idx; i < KHO_XARRAY_TBL_ENTRIES; i++) {
+		if (!leaf->values[i])
+			continue;
+
+		*key = (*key & ~((u64)KHO_XARRAY_TBL_MASK)) | i;
+		*value = leaf->values[i];
+		return true;
+	}
+
+	return false;
+}
+
+static bool __kho_xa_next_node(struct kho_xarray_node *node, u64 *key, u64 *value,
+			       unsigned int level)
 {
 	unsigned int i, idx, shift;
+	bool found;
 
 	idx = kho_xa_node_idx(*key, level);
 	shift = level * KHO_XARRAY_TBL_SHIFT;
@@ -204,21 +225,38 @@ static u64 __kho_xa_next_node(struct kho_xarray_node *node, u64 *key, u64 *value
 	for (i = idx; i < KHO_XARRAY_TBL_ENTRIES; i++) {
 		struct kho_xarray_node *next;
 
+		if (i > idx)
+			*key = (*key & ~((1ULL << (shift + KHO_XARRAY_TBL_SHIFT)) - 1)) |
+			       ((u64)i << shift);
+
 		next = KHOSER_LOAD_PTR(node->table[i]);
 		if (!next)
 			continue;
 
-		if (level == 1) {
-			__kho_xa_next_leaf(next, key, )
-		}
+		if (level == 1)
+			found = __kho_xa_next_leaf((struct kho_xarray_leaf *)next, key, value);
+		else
+			found = __kho_xa_next_node(next, key, value, level - 1);
+
+		if (found)
+			return true;
 	}
+
+	return false;
 }
 
 u64 kho_xa_next(struct kho_xarray *kxa, u64 key, u64 *value)
 {
 	struct kho_xarray_node *root = KHOSER_LOAD_PTR(kxa->root);
 
-	if (!root)
+	if (unlikely(!root))
 		return U64_MAX;
 
+	if (unlikely(fls64(key) > KHO_XARRAY_KEY_WDITH))
+		return U64_MAX;
+
+	if (__kho_xa_next_node(root, &key, value, KHO_XARRAY_DEPTH - 1))
+		return key;
+
+	return U64_MAX;
 }
