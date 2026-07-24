@@ -14,9 +14,8 @@ int kho_xa_set(struct kho_xarray *kxa, u64 key, u64 value);
 void kho_xa_clear(struct kho_xarray *kxa, u64 key);
 
 u64 kho_xa_next(struct kho_xarray *kxa, u64 key, u64 *value);
-
-/* TODO */
-#define kho_xa_for_each(kxa, key, value)		\
-	for (key = kho_xa_next(kxa, 0, &value); key != U64_MAX; key = kho_xa_next(kxa, key + 1, &value))
+#define kho_xa_for_each(kxa, key, value)					\
+	for ((key) = kho_xa_next(kxa, 0, &(value)); (key) != U64_MAX;	\
+	     (key) = kho_xa_next(kxa, (key) + 1, &(value)))
 
 #endif /* _LINUX_KHO_XARRAY_H */
