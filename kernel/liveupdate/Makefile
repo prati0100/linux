@@ -5,7 +5,6 @@ kho-y :=								\
 		kho_block.o						\
 		xarray.o
 
-kho-$(CONFIG_KEXEC_HANDOVER_DEBUG) += kexec_handover_debug.o
 kho-$(CONFIG_KEXEC_HANDOVER_DEBUGFS) += kexec_handover_debugfs.o
 
 obj-$(CONFIG_KEXEC_HANDOVER)		+= kho.o
