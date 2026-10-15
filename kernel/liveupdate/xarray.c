@@ -264,15 +264,17 @@ static u64 __kho_xa_next_leaf(struct kho_xarray_leaf *leaf, u64 key, u64 *value)
 static u64 __kho_xa_next_node(struct kho_xarray_node *node, u64 key, u64 *value,
 			      unsigned int level)
 {
-	unsigned int i, idx, shift;
-	u64 prefix, found;
+	/* Number of keys covered by a single entry at this level. */
+	u64 span = 1UL << (level * KHO_XARRAY_TBL_SHIFT);
+	unsigned int i;
+	u64 found;
 
-	idx = kho_xa_node_idx(key, level);
-	shift = level * KHO_XARRAY_TBL_SHIFT;
-	/* TODO: Make this easier to grok. */
-	prefix = key & ~((1UL << (shift + KHO_XARRAY_TBL_SHIFT)) - 1);
-
-	for (i = idx; i < KHO_XARRAY_TBL_ENTRIES; i++, key = prefix | (i << shift)) {
+	/*
+	 * The first entry is searched starting from key. Every following
+	 * entry is searched from the first key of the subnode.
+	 */
+	for (i = kho_xa_node_idx(key, level); i < KHO_XARRAY_TBL_ENTRIES;
+	     i++, key = round_down(key, span) + span) {
 		struct kho_xarray_node *next;
 
 		next = KHOSER_LOAD_PTR(node->table[i]);
