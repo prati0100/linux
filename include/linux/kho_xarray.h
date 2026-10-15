@@ -12,7 +12,12 @@ void kho_xa_destroy(struct kho_xarray *kxa);
 int kho_xa_restore(struct kho_xarray *kxa);
 
 int kho_xa_set(struct kho_xarray *kxa, u64 key, u64 value);
-void kho_xa_clear(struct kho_xarray *kxa, u64 key);
+
+static inline void kho_xa_clear(struct kho_xarray *kxa, u64 key)
+{
+	/* Storing 0 never allocates and can't fail. */
+	kho_xa_set(kxa, key, 0);
+}
 
 u64 kho_xa_next(struct kho_xarray *kxa, u64 key, u64 *value);
 #define kho_xa_for_each(kxa, key, value)					\

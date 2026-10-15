@@ -166,11 +166,10 @@ int kho_xa_restore(struct kho_xarray *kxa)
 	return err;
 }
 
-/* TODO: Handle value == 0. Two options: first, can treat setting 0 as
- * clearing. So no caller can have a "present" entry with value 0. Second,
- * allow only 63 bit values and then track the "present" bit internally.
- *
- * Not sure which one to pick.
+/*
+ * A value of 0 means the entry is not present, so storing 0 clears the entry.
+ * Clearing never allocates nodes and can't fail for keys in range. Empty nodes
+ * are not freed, they stay in the tree until kho_xa_destroy().
  */
 int kho_xa_set(struct kho_xarray *kxa, u64 key, u64 value)
 {
@@ -181,9 +180,11 @@ int kho_xa_set(struct kho_xarray *kxa, u64 key, u64 value)
 	if (unlikely(fls64(key) > KHO_XARRAY_KEY_WDITH))
 		return -ERANGE;
 
-	might_sleep();
-
 	if (!root) {
+		/* No tree, so the entry is already clear. */
+		if (!value)
+			return 0;
+
 		root = kho_xa_alloc_node();
 		if (!root)
 			return -ENOMEM;
@@ -205,6 +206,10 @@ int kho_xa_set(struct kho_xarray *kxa, u64 key, u64 value)
 			continue;
 		}
 
+		/* No node on the path, so the entry is already clear. */
+		if (!value)
+			return 0;
+
 		next = kho_xa_alloc_node();
 		if (!next)
 			/* kho_xa_destroy() should clean up leftover nodes. */
@@ -220,35 +225,6 @@ int kho_xa_set(struct kho_xarray *kxa, u64 key, u64 value)
 	leaf->values[idx] = value;
 
 	return 0;
-}
-
-/*
- * Empty nodes are not freed here, they stay in the tree until
- * kho_xa_destroy().
- */
-void kho_xa_clear(struct kho_xarray *kxa, u64 key)
-{
-	struct kho_xarray_node *root = KHOSER_LOAD_PTR(kxa->root), *node;
-	struct kho_xarray_leaf *leaf;
-	unsigned int i, idx;
-
-	if (unlikely(fls64(key) > KHO_XARRAY_KEY_WDITH))
-		return;
-
-	if (!root)
-		return;
-
-	node = root;
-	for (i = KHO_XARRAY_DEPTH - 1; i > 0; i--) {
-		idx = kho_xa_node_idx(key, i);
-		node = KHOSER_LOAD_PTR(node->table[idx]);
-		if (!node)
-			return;
-	}
-
-	leaf = (struct kho_xarray_leaf *)node;
-	idx = kho_xa_node_idx(key, 0);
-	leaf->values[idx] = 0;
 }
 
 static u64 __kho_xa_next_leaf(struct kho_xarray_leaf *leaf, u64 key, u64 *value)
