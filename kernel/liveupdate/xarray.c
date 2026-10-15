@@ -12,11 +12,6 @@ void kho_xa_init(struct kho_xarray *kxa)
 	KHOSER_CLEAR_PTR(kxa->root);
 }
 
-void kho_xa_destroy(struct kho_xarray *kxa)
-{
-	/* TODO */
-}
-
 static unsigned int kho_xa_node_idx(u64 key, unsigned int level)
 {
 	return (key >> (level * KHO_XARRAY_TBL_SHIFT)) & KHO_XARRAY_TBL_MASK;
@@ -46,6 +41,47 @@ err_put_folio:
 	folio_put(folio);
 
 	return NULL;
+}
+
+static void kho_xa_free_node(void *node)
+{
+	struct folio *folio = virt_to_folio(node);
+
+	kho_unpreserve_folio(folio);
+	kfree(folio_detach_private(folio));
+	folio_put(folio);
+}
+
+static void __kho_xa_destroy_node(struct kho_xarray_node *node,
+				  unsigned int level)
+{
+	unsigned int i;
+
+	/* Level 0 nodes are leaves and hold values, not pointers. */
+	if (level == 0) {
+		kho_xa_free_node(node);
+		return;
+	}
+
+	for (i = 0; i < KHO_XARRAY_TBL_ENTRIES; i++) {
+		struct kho_xarray_node *next = KHOSER_LOAD_PTR(node->table[i]);
+
+		if (next)
+			__kho_xa_destroy_node(next, level - 1);
+	}
+
+	kho_xa_free_node(node);
+}
+
+void kho_xa_destroy(struct kho_xarray *kxa)
+{
+	struct kho_xarray_node *root = KHOSER_LOAD_PTR(kxa->root);
+
+	if (!root)
+		return;
+
+	__kho_xa_destroy_node(root, KHO_XARRAY_DEPTH - 1);
+	KHOSER_CLEAR_PTR(kxa->root);
 }
 
 static void kho_xa_set_node(struct kho_xarray_node *node,
@@ -109,48 +145,48 @@ static unsigned long kho_xa_leaf_count(struct kho_xarray_leaf *leaf)
 	return *count;
 }
 
+/*
+ * Walk down the path of @key and free every node on it that has no used
+ * entries left. The path is allowed to end early (a missing child), so this
+ * can also clean up after a partially failed kho_xa_set().
+ *
+ * Return: true if @node itself is now empty and should be freed by the caller.
+ */
 static bool __kho_xa_cleanup_nodes(struct kho_xarray_node *node, u64 key,
 				   unsigned int level)
 {
 	unsigned int idx = kho_xa_node_idx(key, level);
 	struct kho_xarray_node *next;
-	struct folio *folio;
 	bool empty;
 
 	next = KHOSER_LOAD_PTR(node->table[idx]);
+	if (next) {
+		if (level == 1)
+			empty = !kho_xa_leaf_count((struct kho_xarray_leaf *)next);
+		else
+			empty = __kho_xa_cleanup_nodes(next, key, level - 1);
 
-	if (level == 1)
-		empty = !!kho_xa_leaf_count((struct kho_xarray_leaf *)next);
-	else
-		empty = __kho_xa_cleanup_nodes(next, key, level - 1);
+		if (empty) {
+			kho_xa_clear_node(node, idx);
+			kho_xa_free_node(next);
+		}
+	}
 
-	if (!empty)
-		return false;
-
-	kho_xa_clear_node(node, idx);
-
-	folio = virt_to_folio(next);
-	folio_put(folio);
-
-	return !!kho_xa_node_count(node);
+	return !kho_xa_node_count(node);
 }
 
 static void kho_xa_cleanup_nodes(struct kho_xarray *kxa, u64 key)
 {
-	struct kho_xarray_node *root;
-	struct folio *folio;
-	bool empty;
+	struct kho_xarray_node *root = KHOSER_LOAD_PTR(kxa->root);
 
-	root = KHOSER_LOAD_PTR(kxa->root);
-	empty = __kho_xa_cleanup_nodes(root, key, KHO_XARRAY_DEPTH - 1);
+	if (!root)
+		return;
 
-	if (!empty)
+	if (!__kho_xa_cleanup_nodes(root, key, KHO_XARRAY_DEPTH - 1))
 		return;
 
 	KHOSER_CLEAR_PTR(kxa->root);
-
-	folio = virt_to_folio(root);
-	folio_put(folio);
+	kho_xa_free_node(root);
 }
 
 /* TODO: Handle value == 0. Two options: first, can treat setting 0 as
@@ -212,7 +248,7 @@ int kho_xa_set(struct kho_xarray *kxa, u64 key, u64 value)
 	return 0;
 
 err_free_nodes:
-	/* TODO */
+	kho_xa_cleanup_nodes(kxa, key);
 	return err;
 }
 
@@ -228,8 +264,8 @@ void kho_xa_clear(struct kho_xarray *kxa, u64 key)
 	if (!root)
 		return;
 
-
-	for (i = KHO_TREE_MAX_DEPTH - 1; i > 0; i--) {
+	node = root;
+	for (i = KHO_XARRAY_DEPTH - 1; i > 0; i--) {
 		idx = kho_xa_node_idx(key, i);
 		node = KHOSER_LOAD_PTR(node->table[idx]);
 		if (!node)
