@@ -1,4 +1,9 @@
-/* TODO: License, copyright, etc. */
+// SPDX-License-Identifier: GPL-2.0
+
+/*
+ * Copyright (c) 2026, Google LLC.
+ * Pratyush Yadav <pratyush@kernel.org>
+ */
 
 #include <linux/io.h>
 #include <linux/mm.h>

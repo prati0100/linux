@@ -1,4 +1,9 @@
-/* TODO: License, copyright, etc. */
+/* SPDX-License-Identifier: GPL-2.0 */
+/*
+ * Copyright (c) 2026, Google LLC.
+ * Pratyush Yadav <pratyush@kernel.org>
+ */
+
 #ifndef _LINUX_KHO_ABI_XARRAY_H
 #define _LINUX_KHO_ABI_XARRAY_H
 
