@@ -9,6 +9,7 @@
 
 void kho_xa_init(struct kho_xarray *kxa);
 void kho_xa_destroy(struct kho_xarray *kxa);
+int kho_xa_restore(struct kho_xarray *kxa);
 
 int kho_xa_set(struct kho_xarray *kxa, u64 key, u64 value);
 void kho_xa_clear(struct kho_xarray *kxa, u64 key);

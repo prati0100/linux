@@ -5,7 +5,6 @@
 #include <linux/kexec_handover.h>
 #include <linux/kho/abi/xarray.h>
 #include <linux/kho_xarray.h>
-#include <linux/pagemap.h>
 
 void kho_xa_init(struct kho_xarray *kxa)
 {
@@ -20,27 +19,16 @@ static unsigned int kho_xa_node_idx(u64 key, unsigned int level)
 static struct kho_xarray_node *kho_xa_alloc_node(void)
 {
 	struct folio *folio = folio_alloc(GFP_KERNEL | __GFP_ZERO, 0);
-	unsigned long *count;
 
 	if (!folio)
 		return NULL;
 
-	count = kzalloc_obj(*count);
-	if (!count)
-		goto err_put_folio;
+	if (kho_preserve_folio(folio)) {
+		folio_put(folio);
+		return NULL;
+	}
 
-	if (kho_preserve_folio(folio))
-		goto err_free_count;
-
-	folio_attach_private(folio, count);
 	return folio_address(folio);
-
-err_free_count:
-	kfree(count);
-err_put_folio:
-	folio_put(folio);
-
-	return NULL;
 }
 
 static void kho_xa_free_node(void *node)
@@ -48,8 +36,32 @@ static void kho_xa_free_node(void *node)
 	struct folio *folio = virt_to_folio(node);
 
 	kho_unpreserve_folio(folio);
-	kfree(folio_detach_private(folio));
 	folio_put(folio);
+}
+
+static int kho_xa_restore_folio(void *node)
+{
+	struct folio *folio = kho_restore_folio(virt_to_phys(node));
+	int err;
+
+	if (!folio)
+		return -EINVAL;
+
+	if (WARN_ON_ONCE(folio_order(folio))) {
+		err = -EINVAL;
+		goto err_put_folio;
+	}
+
+	/* Re-preserve the folio so all other kho_xa_*() functions work. */
+	err = kho_preserve_folio(folio);
+	if (err)
+		goto err_put_folio;
+
+	return 0;
+
+err_put_folio:
+	folio_put(folio);
+	return err;
 }
 
 static void __kho_xa_destroy_node(struct kho_xarray_node *node,
@@ -84,109 +96,74 @@ void kho_xa_destroy(struct kho_xarray *kxa)
 	KHOSER_CLEAR_PTR(kxa->root);
 }
 
-static void kho_xa_set_node(struct kho_xarray_node *node,
-			    struct kho_xarray_node *next,
-			    unsigned int idx)
+/*
+ * Restore @node and everything below it.
+ *
+ * On failure, everything that was restored is freed again and the caller must
+ * drop its reference to @node. Nodes that could not be restored are leaked.
+ */
+static int __kho_xa_restore_node(struct kho_xarray_node *node,
+				 unsigned int level)
 {
-	struct folio *folio = virt_to_folio(node);
-	unsigned long *count = folio_get_private(folio);
+	unsigned int i, j;
+	int err;
 
-	KHOSER_STORE_PTR(node->table[idx], next);
-	(*count)++;
-}
+	err = kho_xa_restore_folio(node);
+	if (err)
+		return err;
 
-static void kho_xa_set_leaf(struct kho_xarray_leaf *leaf, u64 value,
-			    unsigned int idx)
-{
-	struct folio *folio = virt_to_folio(leaf);
-	unsigned long *count = folio_get_private(folio);
+	/* Level 0 nodes are leaves and hold values, not pointers. */
+	if (level == 0)
+		return 0;
 
-	/* If the entry is empty, count it as used now. */
-	if (!leaf->values[idx])
-		(*count)++;
+	for (i = 0; i < KHO_XARRAY_TBL_ENTRIES; i++) {
+		struct kho_xarray_node *next = KHOSER_LOAD_PTR(node->table[i]);
 
-	leaf->values[idx] = value;
-}
+		if (!next)
+			continue;
 
-static void kho_xa_clear_node(struct kho_xarray_node *node, unsigned int idx)
-{
-	struct folio *folio = virt_to_folio(node);
-	unsigned long *count = folio_get_private(folio);
+		err = __kho_xa_restore_node(next, level - 1);
+		if (err)
+			goto err_destroy;
+	}
 
-	KHOSER_CLEAR_PTR(node->table[idx]);
-	(*count)--;
-}
+	return 0;
 
-static void kho_xa_clear_leaf(struct kho_xarray_leaf *leaf, unsigned int idx)
-{
-	struct folio *folio = virt_to_folio(leaf);
-	unsigned long *count = folio_get_private(folio);
-
-	/* If the entry is used, count it as free now. */
-	if (leaf->values[idx])
-		(*count)--;
-
-	leaf->values[idx] = 0;
-}
-
-static unsigned long kho_xa_node_count(struct kho_xarray_node *node)
-{
-	struct folio *folio = virt_to_folio(node);
-	unsigned long *count = folio_get_private(folio);
-
-	return *count;
-}
-
-static unsigned long kho_xa_leaf_count(struct kho_xarray_leaf *leaf)
-{
-	struct folio *folio = virt_to_folio(leaf);
-	unsigned long *count = folio_get_private(folio);
-
-	return *count;
+err_destroy:
+	/*
+	 * next has already freed itself, and the entries after it were never
+	 * restored. Cut them all off, then free what is left.
+	 */
+	for (j = i; j < KHO_XARRAY_TBL_ENTRIES; j++)
+		KHOSER_CLEAR_PTR(node->table[j]);
+	__kho_xa_destroy_node(node, level);
+	return err;
 }
 
 /*
- * Walk down the path of @key and free every node on it that has no used
- * entries left. The path is allowed to end early (a missing child), so this
- * can also clean up after a partially failed kho_xa_set().
+ * Take over a tree handed over by the previous kernel. All nodes are restored
+ * and preserved again, so afterwards the tree can be used with all the other
+ * kho_xa_*() functions, and is carried over to the next kernel.
  *
- * Return: true if @node itself is now empty and should be freed by the caller.
+ * kho_xa_next() can be used before calling this, but nothing that modifies or
+ * frees the tree.
+ *
+ * On failure, the tree is destroyed. Nodes that could not be restored are
+ * leaked.
  */
-static bool __kho_xa_cleanup_nodes(struct kho_xarray_node *node, u64 key,
-				   unsigned int level)
-{
-	unsigned int idx = kho_xa_node_idx(key, level);
-	struct kho_xarray_node *next;
-	bool empty;
-
-	next = KHOSER_LOAD_PTR(node->table[idx]);
-	if (next) {
-		if (level == 1)
-			empty = !kho_xa_leaf_count((struct kho_xarray_leaf *)next);
-		else
-			empty = __kho_xa_cleanup_nodes(next, key, level - 1);
-
-		if (empty) {
-			kho_xa_clear_node(node, idx);
-			kho_xa_free_node(next);
-		}
-	}
-
-	return !kho_xa_node_count(node);
-}
-
-static void kho_xa_cleanup_nodes(struct kho_xarray *kxa, u64 key)
+int kho_xa_restore(struct kho_xarray *kxa)
 {
 	struct kho_xarray_node *root = KHOSER_LOAD_PTR(kxa->root);
+	int err;
 
 	if (!root)
-		return;
+		return 0;
 
-	if (!__kho_xa_cleanup_nodes(root, key, KHO_XARRAY_DEPTH - 1))
-		return;
+	err = __kho_xa_restore_node(root, KHO_XARRAY_DEPTH - 1);
+	if (err)
+		KHOSER_CLEAR_PTR(kxa->root);
 
-	KHOSER_CLEAR_PTR(kxa->root);
-	kho_xa_free_node(root);
+	return err;
 }
 
 /* TODO: Handle value == 0. Two options: first, can treat setting 0 as
@@ -200,7 +177,6 @@ int kho_xa_set(struct kho_xarray *kxa, u64 key, u64 value)
 	struct kho_xarray_node *root = KHOSER_LOAD_PTR(kxa->root), *node;
 	struct kho_xarray_leaf *leaf;
 	unsigned int i, idx;
-	int err;
 
 	if (unlikely(fls64(key) > KHO_XARRAY_KEY_WDITH))
 		return -ERANGE;
@@ -229,29 +205,27 @@ int kho_xa_set(struct kho_xarray *kxa, u64 key, u64 value)
 			continue;
 		}
 
-		/* Node doesn't exist, need to allocate it. */
 		next = kho_xa_alloc_node();
-		if (!next) {
-			err = -ENOMEM;
-			goto err_free_nodes;
-		}
+		if (!next)
+			/* kho_xa_destroy() should clean up leftover nodes. */
+			return -ENOMEM;
 
-		kho_xa_set_node(node, next, idx);
+		KHOSER_STORE_PTR(node->table[idx], next);
 		node = next;
 	}
 
 	/* node now points to the leaf node. */
 	leaf = (struct kho_xarray_leaf *)node;
 	idx = kho_xa_node_idx(key, 0);
-	kho_xa_set_leaf(leaf, value, idx);
+	leaf->values[idx] = value;
 
 	return 0;
-
-err_free_nodes:
-	kho_xa_cleanup_nodes(kxa, key);
-	return err;
 }
 
+/*
+ * Empty nodes are not freed here, they stay in the tree until
+ * kho_xa_destroy().
+ */
 void kho_xa_clear(struct kho_xarray *kxa, u64 key)
 {
 	struct kho_xarray_node *root = KHOSER_LOAD_PTR(kxa->root), *node;
@@ -274,9 +248,7 @@ void kho_xa_clear(struct kho_xarray *kxa, u64 key)
 
 	leaf = (struct kho_xarray_leaf *)node;
 	idx = kho_xa_node_idx(key, 0);
-	kho_xa_clear_leaf(leaf, idx);
-	if (!kho_xa_leaf_count(leaf))
-		kho_xa_cleanup_nodes(kxa, key);
+	leaf->values[idx] = 0;
 }
 
 static u64 __kho_xa_next_leaf(struct kho_xarray_leaf *leaf, u64 key, u64 *value)
