@@ -3390,6 +3390,10 @@ config TEST_KEXEC_HANDOVER
 	  the first kernel and restores and verifies the data on the boot of
 	  kexec'ed kernel.
 
+	  It also tests the KHO xarray: the first kernel runs functional checks
+	  and builds and preserves a tree, and the kexec'ed kernel restores,
+	  modifies and destroys it.
+
 	  For detailed documentation about KHO, see Documentation/core-api/kho.
 
 	  To run the test run:

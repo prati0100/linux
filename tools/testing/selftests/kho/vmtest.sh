@@ -119,6 +119,8 @@ function run_qemu() {
 		  -initrd "$initrd"
 
 	grep "KHO restore succeeded" "$serial" &> /dev/null || fail "KHO failed"
+	grep "KHO xarray restore succeeded" "$serial" &> /dev/null || \
+		fail "KHO xarray failed"
 }
 
 function target_to_arch() {
