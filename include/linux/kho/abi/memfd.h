@@ -11,8 +11,11 @@
 #ifndef _LINUX_KHO_ABI_MEMFD_H
 #define _LINUX_KHO_ABI_MEMFD_H
 
+#include <linux/bits.h>
+#include <linux/build_bug.h>
 #include <linux/types.h>
 #include <linux/kho/abi/kexec_handover.h>
+#include <linux/kho/abi/xarray.h>
 
 /**
  * DOC: memfd Live Update ABI
@@ -22,6 +25,10 @@
  *
  * The state is serialized into a packed structure `struct memfd_luo_ser`
  * which is handed over to the next kernel via the KHO mechanism.
+ *
+ * The folios of the file are stored in a KHO xarray. The value at a folio index
+ * is a ``union memfd_luo_folio_ser``. A value of 0 means there is no folio at
+ * that offset.
  *
  * This interface is a contract. Any modification to the structure layout
  * constitutes a breaking change. Such changes require incrementing the
@@ -45,16 +52,21 @@
 #define MEMFD_LUO_FOLIO_UPTODATE	BIT(1)
 
 /**
- * struct memfd_luo_folio_ser - Serialized state of a single folio.
- * @pfn:       The page frame number of the folio.
- * @flags:     Flags to describe the state of the folio.
- * @index:     The page offset (pgoff_t) of the folio within the original file.
+ * union memfd_luo_folio_ser - Serialized state of a single folio.
+ * @val:   The raw value stored in the KHO xarray.
+ * @pfn:   The page frame number of the folio.
+ * @flags: Flags to describe the state of the folio.
  */
-struct memfd_luo_folio_ser {
-	u64 pfn:52;
-	u64 flags:12;
-	u64 index;
-} __packed;
+union memfd_luo_folio_ser {
+	u64 val;
+	struct {
+		u64 pfn:52;
+		u64 flags:12;
+	};
+};
+
+/* It must fit into a KHO xarray entry. */
+static_assert(sizeof(union memfd_luo_folio_ser) == sizeof(u64));
 
 /*
  * The set of seals this version supports preserving. If support for any new
@@ -74,20 +86,17 @@ struct memfd_luo_folio_ser {
  * @seals:     The seals present on the memfd. The seals are uABI so it is safe
  *             to directly use them in the ABI.
  * @flags:     Flags for the file. Unused flag bits must be set to 0.
- * @nr_folios: Number of folios in the folios array.
- * @folios:    KHO vmalloc descriptor pointing to the array of
- *             struct memfd_luo_folio_ser.
+ * @folios:    Folios in the file.
  */
 struct memfd_luo_ser {
 	u64 pos;
 	u64 size;
 	u32 seals;
 	u32 flags;
-	u64 nr_folios;
-	struct kho_vmalloc folios;
+	struct kho_xarray folios;
 } __packed;
 
 /* The compatibility string for memfd file handler */
-#define MEMFD_LUO_FH_COMPATIBLE	"memfd-v2"
+#define MEMFD_LUO_FH_COMPATIBLE	"memfd-v3"
 
 #endif /* _LINUX_KHO_ABI_MEMFD_H */
