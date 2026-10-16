@@ -11,8 +11,11 @@
 #ifndef _LINUX_KHO_ABI_MEMFD_H
 #define _LINUX_KHO_ABI_MEMFD_H
 
+#include <linux/bits.h>
+#include <linux/build_bug.h>
 #include <linux/types.h>
 #include <linux/kho/abi/kexec_handover.h>
+#include <linux/kho/abi/xarray.h>
 
 /**
  * DOC: memfd Live Update ABI
@@ -45,16 +48,35 @@
 #define MEMFD_LUO_FOLIO_UPTODATE	BIT(1)
 
 /**
- * struct memfd_luo_folio_ser - Serialized state of a single folio.
- * @pfn:       The page frame number of the folio.
- * @flags:     Flags to describe the state of the folio.
- * @index:     The page offset (pgoff_t) of the folio within the original file.
+ * DOC: memfd folio entries
+ *
+ * The folios of a memfd are stored in a KHO xarray (see
+ * ``include/linux/kho/abi/xarray.h``), keyed by the page offset (pgoff_t) of the
+ * folio within the file. The value of each entry is a
+ * ``union memfd_luo_folio_entry``.
+ *
+ * A value of 0 means there is no folio at that offset. A preserved folio always
+ * has at least one flag set, so its entry is never 0.
  */
-struct memfd_luo_folio_ser {
-	u64 pfn:52;
-	u64 flags:12;
-	u64 index;
-} __packed;
+
+/**
+ * union memfd_luo_folio_entry - Serialized state of a single folio.
+ * @val:   The raw value stored in the KHO xarray.
+ * @pfn:   The page frame number of the folio.
+ * @flags: Flags describing the state of the folio. See %MEMFD_LUO_FOLIO_DIRTY
+ *         and %MEMFD_LUO_FOLIO_UPTODATE.
+ *
+ * The bitfield layout is defined by the psABI of the architecture. KHO only
+ * hands over between kernels of the same architecture, so it is stable.
+ */
+union memfd_luo_folio_entry {
+	u64 val;
+	struct {
+		u64 pfn:52;
+		u64 flags:12;
+	};
+};
+static_assert(sizeof(union memfd_luo_folio_entry) == sizeof(u64));
 
 /*
  * The set of seals this version supports preserving. If support for any new
@@ -74,20 +96,18 @@ struct memfd_luo_folio_ser {
  * @seals:     The seals present on the memfd. The seals are uABI so it is safe
  *             to directly use them in the ABI.
  * @flags:     Flags for the file. Unused flag bits must be set to 0.
- * @nr_folios: Number of folios in the folios array.
- * @folios:    KHO vmalloc descriptor pointing to the array of
- *             struct memfd_luo_folio_ser.
+ * @folios:    KHO xarray of the folios in the file, keyed by page offset. See
+ *             "memfd folio entries" above for the format of the values.
  */
 struct memfd_luo_ser {
 	u64 pos;
 	u64 size;
 	u32 seals;
 	u32 flags;
-	u64 nr_folios;
-	struct kho_vmalloc folios;
+	struct kho_xarray folios;
 } __packed;
 
 /* The compatibility string for memfd file handler */
-#define MEMFD_LUO_FH_COMPATIBLE	"memfd-v2"
+#define MEMFD_LUO_FH_COMPATIBLE	"memfd-v3"
 
 #endif /* _LINUX_KHO_ABI_MEMFD_H */

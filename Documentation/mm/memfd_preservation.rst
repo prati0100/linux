@@ -14,6 +14,9 @@ Memfd Preservation ABI
    :doc: memfd Live Update ABI
 
 .. kernel-doc:: include/linux/kho/abi/memfd.h
+   :doc: memfd folio entries
+
+.. kernel-doc:: include/linux/kho/abi/memfd.h
    :internal:
 
 See Also
