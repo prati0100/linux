@@ -94,6 +94,18 @@ KHO Serialization Blocks API
 .. kernel-doc:: kernel/liveupdate/kho_block.c
   :internal:
 
+KHO xarray
+==========
+
+.. kernel-doc:: kernel/liveupdate/xarray.c
+  :doc: KHO xarray
+
+.. kernel-doc:: include/linux/kho_xarray.h
+  :identifiers: kho_xa_clear kho_xa_for_each
+
+.. kernel-doc:: kernel/liveupdate/xarray.c
+  :internal:
+
 See Also
 ========
 

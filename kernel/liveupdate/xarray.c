@@ -5,12 +5,38 @@
  * Pratyush Yadav <pratyush@kernel.org>
  */
 
+/**
+ * DOC: KHO xarray (eXtensible array)
+ *
+ * TODO: Should I choose a less confusing name?
+ *
+ * The KHO xarray is a sparse map from integer keys (at most
+ * %KHO_XARRAY_KEY_WDITH wide) to non-zero u64 values, kept in memory that is
+ * preserved with KHO.
+ *
+ * Internally it is a radix tree of fixed depth, with one page per node. Each
+ * node is preserved as soon as it is allocated, so the tree is ready to be
+ * handed over at any point. A tree is referenced by a ``struct kho_xarray``. To
+ * hand a tree over, embed its ``struct kho_xarray`` in the serialized payload.
+ *
+ * Things to keep in mind:
+ *
+ * - Nodes are never freed when their entries are removed, only by
+ *   kho_xa_destroy(). The memory used by a tree only grows until then.
+ * - There is no internal locking. Callers must serialize all accesses to a
+ *   tree, including lookups that race with modifications.
+ */
+
 #include <linux/io.h>
 #include <linux/mm.h>
 #include <linux/kexec_handover.h>
 #include <linux/kho/abi/xarray.h>
 #include <linux/kho_xarray.h>
 
+/**
+ * kho_xa_init() - Initialize an empty KHO xarray.
+ * @kxa: The KHO xarray.
+ */
 void kho_xa_init(struct kho_xarray *kxa)
 {
 	KHOSER_CLEAR_PTR(kxa->root);
@@ -90,6 +116,15 @@ static void __kho_xa_destroy_node(struct kho_xarray_node *node,
 	kho_xa_free_node(node);
 }
 
+/**
+ * kho_xa_destroy() - Free all nodes of a KHO xarray.
+ * @kxa: The KHO xarray.
+ *
+ * Unpreserves and frees every node, leaving an empty tree behind that can be
+ * used again.
+ *
+ * Post-KHO, this can only be called after kho_xa_restore() has succeeded.
+ */
 void kho_xa_destroy(struct kho_xarray *kxa)
 {
 	struct kho_xarray_node *root = KHOSER_LOAD_PTR(kxa->root);
@@ -145,16 +180,19 @@ err_destroy:
 	return err;
 }
 
-/*
- * Take over a tree handed over by the previous kernel. All nodes are restored
- * and preserved again, so afterwards the tree can be used with all the other
- * kho_xa_*() functions, and is carried over to the next kernel.
+/**
+ * kho_xa_restore() - Restore KHO xarray.
+ * @kxa: The KHO xarray
  *
- * kho_xa_next() can be used before calling this, but nothing that modifies or
- * frees the tree.
+ * Restores every node of the tree and preserves it again. Afterwards the tree
+ * can be used with all other kho_xa_*() functions, exactly like a tree built
+ * in this kernel.
  *
- * On failure, the tree is destroyed. Nodes that could not be restored are
- * leaked.
+ * kho_xa_next() and kho_xa_for_each() can be used before calling this, but
+ * nothing that modifies or frees the tree.
+ *
+ * Return: 0 on success, or -errno on failure. On failure the tree is destroyed,
+ * and nodes that could not be restored are leaked.
  */
 int kho_xa_restore(struct kho_xarray *kxa)
 {
@@ -171,10 +209,20 @@ int kho_xa_restore(struct kho_xarray *kxa)
 	return err;
 }
 
-/*
- * A value of 0 means the entry is not present, so storing 0 clears the entry.
- * Clearing never allocates nodes and can't fail for keys in range. Empty nodes
- * are not freed, they stay in the tree until kho_xa_destroy().
+/**
+ * kho_xa_set() - Store a value in a KHO xarray.
+ * @kxa: The KHO xarray.
+ * @key: Key of the entry. At most %KHO_XARRAY_KEY_WDITH bits wide.
+ * @value: Value to store.
+ *
+ * Adds an entry, or replaces the value of an existing one.
+ *
+ * A value of 0 means the entry is not present, so storing 0 removes the entry.
+ * Removing never allocates nodes and can't fail for keys in range. Nodes that
+ * become empty are not freed, they stay in the tree until kho_xa_destroy().
+ *
+ * Context: Can sleep when @value is not 0.
+ * Return: 0 on success, -errno on failure.
  */
 int kho_xa_set(struct kho_xarray *kxa, u64 key, u64 value)
 {
@@ -282,6 +330,17 @@ static u64 __kho_xa_next_node(struct kho_xarray_node *node, u64 key, u64 *value,
 	return U64_MAX;
 }
 
+/**
+ * kho_xa_next() - Find the next entry in a KHO xarray.
+ * @kxa: The KHO xarray.
+ * @key: Key to start searching from.
+ * @value: Set to the value of the entry found. Left alone if none is found.
+ *
+ * Finds the entry with the smallest key that is greater than or equal to @key.
+ *
+ * Return: The key of the entry found, or %U64_MAX if there is none. %U64_MAX
+ * is never a valid key, since it is wider than %KHO_XARRAY_KEY_WDITH.
+ */
 u64 kho_xa_next(struct kho_xarray *kxa, u64 key, u64 *value)
 {
 	struct kho_xarray_node *root = KHOSER_LOAD_PTR(kxa->root);
