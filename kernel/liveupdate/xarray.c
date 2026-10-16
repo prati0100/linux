@@ -188,8 +188,8 @@ err_destroy:
  * can be used with all other kho_xa_*() functions, exactly like a tree built
  * in this kernel.
  *
- * kho_xa_next() and kho_xa_for_each() can be used before calling this, but
- * nothing that modifies or frees the tree.
+ * kho_xa_get(), kho_xa_next() and kho_xa_for_each() can be used before calling
+ * this, but nothing that modifies or frees the tree.
  *
  * Return: 0 on success, or -errno on failure. On failure the tree is destroyed,
  * and nodes that could not be restored are leaked.
@@ -278,6 +278,33 @@ int kho_xa_set(struct kho_xarray *kxa, u64 key, u64 value)
 	leaf->values[idx] = value;
 
 	return 0;
+}
+
+/**
+ * kho_xa_get() - Look up a value in a KHO xarray.
+ * @kxa: The KHO xarray.
+ * @key: Key of the entry.
+ *
+ * Return: The value of the entry, or 0 if there is no entry for @key or it is
+ * out of range.
+ */
+u64 kho_xa_get(struct kho_xarray *kxa, u64 key)
+{
+	struct kho_xarray_node *node = KHOSER_LOAD_PTR(kxa->root);
+	struct kho_xarray_leaf *leaf;
+	unsigned int i;
+
+	if (unlikely(fls64(key) > KHO_XARRAY_KEY_WDITH))
+		return 0;
+
+	for (i = KHO_XARRAY_DEPTH - 1; node && i > 0; i--)
+		node = KHOSER_LOAD_PTR(node->table[kho_xa_node_idx(key, i)]);
+
+	if (!node)
+		return 0;
+
+	leaf = (struct kho_xarray_leaf *)node;
+	return leaf->values[kho_xa_node_idx(key, 0)];
 }
 
 static u64 __kho_xa_next_leaf(struct kho_xarray_leaf *leaf, u64 key, u64 *value)

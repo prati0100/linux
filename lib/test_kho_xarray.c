@@ -100,6 +100,13 @@ static int __init kho_xa_test_verify(struct kho_xarray *kxa, const u64 *keys,
 			return -EINVAL;
 		}
 
+		/* Direct lookups must agree with iteration. */
+		if (kho_xa_get(kxa, key) != value) {
+			pr_err("entry %u: kho_xa_get(%#llx) = %#llx, expected %#llx\n",
+			       i, key, kho_xa_get(kxa, key), value);
+			return -EINVAL;
+		}
+
 		i++;
 	}
 
@@ -178,14 +185,19 @@ static int __init kho_xa_test_empty(struct kho_xarray *kxa)
 }
 
 /*
- * A single key can be found again with its value, nothing is found after it,
- * and it takes exactly one node per level.
+ * A single key can be found again with its value, by lookup and by iteration,
+ * neighbouring keys have no entry, and it takes exactly one node per level.
  */
 static int __init kho_xa_test_set_get(struct kho_xarray *kxa)
 {
 	u64 value = 0;
 
+	KHO_XA_ASSERT_EQ(kho_xa_get(kxa, 42), 0);
 	KHO_XA_ASSERT_EQ(kho_xa_set(kxa, 42, 0xdead), 0);
+
+	KHO_XA_ASSERT_EQ(kho_xa_get(kxa, 42), 0xdead);
+	KHO_XA_ASSERT_EQ(kho_xa_get(kxa, 41), 0);
+	KHO_XA_ASSERT_EQ(kho_xa_get(kxa, 43), 0);
 
 	KHO_XA_ASSERT_EQ(kho_xa_next(kxa, 0, &value), 42);
 	KHO_XA_ASSERT_EQ(value, 0xdead);
@@ -199,7 +211,8 @@ static int __init kho_xa_test_set_get(struct kho_xarray *kxa)
 
 /*
  * The smallest and largest valid keys work, keys past the maximum are rejected
- * by kho_xa_set() and ignored by kho_xa_clear() and kho_xa_next().
+ * by kho_xa_set() and ignored by kho_xa_clear(), kho_xa_get() and
+ * kho_xa_next().
  */
 static int __init kho_xa_test_key_range(struct kho_xarray *kxa)
 {
@@ -211,6 +224,10 @@ static int __init kho_xa_test_key_range(struct kho_xarray *kxa)
 
 	/* Out of range clear is ignored. */
 	kho_xa_clear(kxa, KHO_XA_TEST_KEY_MAX + 1);
+
+	KHO_XA_ASSERT_EQ(kho_xa_get(kxa, 0), 1);
+	KHO_XA_ASSERT_EQ(kho_xa_get(kxa, KHO_XA_TEST_KEY_MAX), 2);
+	KHO_XA_ASSERT_EQ(kho_xa_get(kxa, KHO_XA_TEST_KEY_MAX + 1), 0);
 
 	KHO_XA_ASSERT_EQ(kho_xa_next(kxa, 0, &value), 0);
 	KHO_XA_ASSERT_EQ(value, 1);
@@ -287,6 +304,7 @@ static int __init kho_xa_test_overwrite_clear(struct kho_xarray *kxa)
 	kho_xa_clear(kxa, 10);
 
 	KHO_XA_ASSERT_EQ(kho_xa_next(kxa, 0, &value), U64_MAX);
+	KHO_XA_ASSERT_EQ(kho_xa_get(kxa, 10), 0);
 
 	return 0;
 }
