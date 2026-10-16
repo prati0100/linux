@@ -76,31 +76,25 @@
 #include <linux/io.h>
 #include <linux/kexec_handover.h>
 #include <linux/kho/abi/memfd.h>
+#include <linux/kho_map.h>
 #include <linux/liveupdate.h>
 #include <linux/migrate.h>
 #include <linux/sched/mm.h>
 #include <linux/sched/signal.h>
 #include <linux/shmem_fs.h>
 #include <linux/swap.h>
-#include <linux/vmalloc.h>
 #include <linux/memfd.h>
 #include <uapi/linux/memfd.h>
 
 #include "internal.h"
 
-static void memfd_luo_put_folios(const struct memfd_luo_folio_ser *folios_ser,
-				 u64 nr_folios)
+static void memfd_luo_put_folios(struct kho_map *map)
 {
-	u64 i;
+	union memfd_luo_folio_ser entry;
+	u64 index;
 
-	for (i = 0; i < nr_folios; i++) {
-		const struct memfd_luo_folio_ser *pfolio = &folios_ser[i];
-		struct folio *folio;
-
-		if (!pfolio->pfn)
-			continue;
-
-		folio = pfn_folio(pfolio->pfn);
+	kho_map_for_each(map, index, entry.val) {
+		struct folio *folio = pfn_folio(entry.pfn);
 
 		kho_unpreserve_folio(folio);
 		folio_put(folio);
@@ -148,13 +142,6 @@ static int memfd_luo_migrate_folio(struct folio *folio)
 	return 0;
 }
 
-/*
- * Look up the folio at @index, allocating it if needed, and make sure it can be
- * held until the next kernel. Folios that are not longterm pinnable are migrated
- * out first, retrying a few times if someone else has them isolated.
- *
- * On success, returns 0 with *@foliop locked and holding a reference.
- */
 static int memfd_luo_get_folio(struct inode *inode, pgoff_t index,
 			       struct folio **foliop)
 {
@@ -182,9 +169,9 @@ static int memfd_luo_get_folio(struct inode *inode, pgoff_t index,
 	return 0;
 }
 
-static int memfd_luo_preserve_folio(struct folio *folio,
-				    struct memfd_luo_folio_ser *pfolio)
+static int memfd_luo_preserve_folio(struct folio *folio, struct kho_map *map)
 {
+	union memfd_luo_folio_ser entry = {};
 	int err;
 
 	err = kho_preserve_folio(folio);
@@ -202,7 +189,7 @@ static int memfd_luo_preserve_folio(struct folio *folio,
 	 * might still be a mapping of the file at freeze().
 	 *
 	 * To see why this is a problem, say a folio is clean at
-	 * preserve, but gets dirtied later. The pfolio flags will mark
+	 * preserve, but gets dirtied later. The preserved flags will mark
 	 * it as clean. After retrieve, the next kernel might try to
 	 * reclaim this folio under memory pressure, losing user data.
 	 *
@@ -212,46 +199,31 @@ static int memfd_luo_preserve_folio(struct folio *folio,
 	 */
 	folio_mark_dirty(folio);
 
-	pfolio->pfn = folio_pfn(folio);
-	pfolio->flags = MEMFD_LUO_FOLIO_DIRTY | MEMFD_LUO_FOLIO_UPTODATE;
-	pfolio->index = folio->index;
+	entry.pfn = folio_pfn(folio);
+	entry.flags = MEMFD_LUO_FOLIO_DIRTY | MEMFD_LUO_FOLIO_UPTODATE;
+	err = kho_map_set(map, folio->index, entry.val);
+	if (err) {
+		kho_unpreserve_folio(folio);
+		return err;
+	}
 
 	return 0;
 }
 
-static int memfd_luo_preserve_folios(struct file *file,
-				     struct kho_vmalloc *kho_vmalloc,
-				     struct memfd_luo_folio_ser **out_folios_ser,
-				     u64 *nr_foliosp)
+static int memfd_luo_preserve_folios(struct file *file, struct kho_map *map)
 {
-	struct memfd_luo_folio_ser *folios_ser, *shrunk;
 	struct inode *inode = file_inode(file);
-	u64 nr_folios = 0, max_folios;
 	unsigned int pin_flags;
 	pgoff_t index = 0, end;
 	int err;
 	loff_t size;
 
 	size = i_size_read(inode);
-	/*
-	 * If the file has zero size, then the folios and nr_folios properties
-	 * are not set.
-	 */
-	if (!size) {
-		*nr_foliosp = 0;
-		*out_folios_ser = NULL;
+	/* If the file has zero size, then the folios map is left empty. */
+	if (!size)
 		return 0;
-	}
 
-	/*
-	 * Guess the number of folios based on inode size. Real number might end
-	 * up being smaller if there are higher order folios.
-	 */
 	end = DIV_ROUND_UP_ULL(size, PAGE_SIZE);
-	max_folios = end;
-	folios_ser = vmalloc_array(max_folios, sizeof(*folios_ser));
-	if (!folios_ser)
-		return -ENOMEM;
 
 	/*
 	 * The folios are held until the next kernel, so keep newly allocated
@@ -273,75 +245,41 @@ static int memfd_luo_preserve_folios(struct file *file,
 			goto err_restore;
 		}
 
-		if (WARN_ON_ONCE(nr_folios >= max_folios)) {
-			err = -EINVAL;
-			goto err_restore;
-		}
-
 		err = memfd_luo_get_folio(inode, index, &folio);
 		if (err)
 			goto err_restore;
 
-		err = memfd_luo_preserve_folio(folio, &folios_ser[nr_folios]);
+		err = memfd_luo_preserve_folio(folio, map);
 		index = folio_next_index(folio);
 		folio_unlock(folio);
 		if (err) {
 			folio_put(folio);
 			goto err_restore;
 		}
-		nr_folios++;
 	}
 	memalloc_pin_restore(pin_flags);
 
-	/*
-	 * Free the unused tail so it doesn't get preserved. If vrealloc fails,
-	 * the folios_ser is still valid.
-	 */
-	shrunk = vrealloc(folios_ser, array_size(nr_folios, sizeof(*folios_ser)),
-			  GFP_KERNEL);
-	if (shrunk)
-		folios_ser = shrunk;
-
-	err = kho_preserve_vmalloc(folios_ser, kho_vmalloc);
-	if (err)
-		goto err_put;
-
-	*nr_foliosp = nr_folios;
-	*out_folios_ser = folios_ser;
-
-	/*
-	 * Note: folios_ser is purposely not freed here. It is preserved
-	 * memory (via KHO). In the 'unpreserve' path, we use the vmap pointer
-	 * that is passed via private_data.
-	 */
 	return 0;
 
 err_restore:
 	memalloc_pin_restore(pin_flags);
-err_put:
-	memfd_luo_put_folios(folios_ser, nr_folios);
-	vfree(folios_ser);
+	memfd_luo_put_folios(map);
+	kho_map_destroy(map);
 	return err;
 }
 
-static void memfd_luo_unpreserve_folios(struct kho_vmalloc *kho_vmalloc,
-					struct memfd_luo_folio_ser *folios_ser,
-					u64 nr_folios)
+static void memfd_luo_unpreserve_folios(struct kho_map *map)
 {
-	if (!nr_folios)
-		return;
-
-	kho_unpreserve_vmalloc(kho_vmalloc);
-	memfd_luo_put_folios(folios_ser, nr_folios);
-	vfree(folios_ser);
+	memfd_luo_put_folios(map);
+	kho_map_destroy(map);
 }
 
 static int memfd_luo_preserve(struct liveupdate_file_op_args *args)
 {
 	struct inode *inode = file_inode(args->file);
-	struct memfd_luo_folio_ser *folios_ser;
 	struct memfd_luo_ser *ser;
-	u64 nr_folios, inode_size;
+	struct kho_map *folios;
+	u64 inode_size;
 	int err = 0, seals;
 
 	inode_lock(inode);
@@ -372,19 +310,38 @@ static int memfd_luo_preserve(struct liveupdate_file_op_args *args)
 	ser->size = inode_size;
 	ser->seals = seals;
 
-	err = memfd_luo_preserve_folios(args->file, &ser->folios,
-					&folios_ser, &nr_folios);
-	if (err)
+	/*
+	 * The runtime handle of the folios map is needed until unpreserve(),
+	 * so keep it in private_data.
+	 */
+	folios = kmalloc_obj(*folios);
+	if (!folios) {
+		err = -ENOMEM;
 		goto err_free_ser;
+	}
 
-	ser->nr_folios = nr_folios;
+	kho_map_init(folios, &ser->folios);
+	/*
+	 * Preserve the empty tree right away, so every node allocated for the
+	 * tree is auto-preserved.
+	 */
+	err = kho_map_preserve(folios);
+	if (err)
+		goto err_free_folios;
+
+	err = memfd_luo_preserve_folios(args->file, folios);
+	if (err)
+		goto err_free_folios;
+
 	inode_unlock(inode);
 
-	args->private_data = folios_ser;
 	args->serialized_data = virt_to_phys(ser);
+	args->private_data = folios;
 
 	return 0;
 
+err_free_folios:
+	kfree(folios);
 err_free_ser:
 	kho_unpreserve_free(ser);
 err_unlock:
@@ -424,27 +381,26 @@ static void memfd_luo_unpreserve(struct liveupdate_file_op_args *args)
 
 	ser = phys_to_virt(args->serialized_data);
 
-	memfd_luo_unpreserve_folios(&ser->folios, args->private_data,
-				    ser->nr_folios);
+	memfd_luo_unpreserve_folios(args->private_data);
+	kfree(args->private_data);
 
 	kho_unpreserve_free(ser);
 	inode_unlock(inode);
 }
 
-static void memfd_luo_discard_folios(const struct memfd_luo_folio_ser *folios_ser,
-				     u64 nr_folios)
+/*
+ * Restore and free all folios in @map with keys starting from @start. @map must
+ * already be restored.
+ */
+static void memfd_luo_discard_folios(struct kho_map *map, u64 start)
 {
-	u64 i;
+	union memfd_luo_folio_ser entry;
+	u64 index;
 
-	for (i = 0; i < nr_folios; i++) {
-		const struct memfd_luo_folio_ser *pfolio = &folios_ser[i];
+	kho_map_for_each_from(map, index, entry.val, start) {
+		phys_addr_t phys = PFN_PHYS(entry.pfn);
 		struct folio *folio;
-		phys_addr_t phys;
 
-		if (!pfolio->pfn)
-			continue;
-
-		phys = PFN_PHYS(pfolio->pfn);
 		folio = kho_restore_folio(phys);
 		if (!folio) {
 			pr_warn_ratelimited("Unable to restore folio at physical address: %llx\n",
@@ -458,7 +414,7 @@ static void memfd_luo_discard_folios(const struct memfd_luo_folio_ser *folios_se
 
 static void memfd_luo_finish(struct liveupdate_file_op_args *args)
 {
-	struct memfd_luo_folio_ser *folios_ser;
+	struct kho_map folios;
 	struct memfd_luo_ser *ser;
 
 	/*
@@ -473,40 +429,40 @@ static void memfd_luo_finish(struct liveupdate_file_op_args *args)
 	if (!ser)
 		return;
 
-	if (ser->nr_folios) {
-		folios_ser = kho_restore_vmalloc(&ser->folios);
-		if (!folios_ser)
-			goto out;
-
-		memfd_luo_discard_folios(folios_ser, ser->nr_folios);
-		vfree(folios_ser);
+	if (kho_map_restore(&folios, &ser->folios)) {
+		pr_warn("Unable to restore folios map\n");
+		goto out;
 	}
+
+	memfd_luo_discard_folios(&folios, 0);
+	kho_map_destroy(&folios);
 
 out:
 	kho_restore_free(ser);
 }
 
 static int memfd_luo_retrieve_folios(struct file *file,
-				     struct memfd_luo_folio_ser *folios_ser,
-				     u64 nr_folios)
+				     struct kho_map_ser *folios_ser)
 {
 	struct inode *inode = file_inode(file);
 	struct address_space *mapping = inode->i_mapping;
-	struct folio *folio;
 	long npages, nr_added_pages = 0;
+	union memfd_luo_folio_ser entry;
+	struct kho_map folios;
+	struct folio *folio;
 	int err = -EIO;
-	long i;
+	u64 index;
 
-	for (i = 0; i < nr_folios; i++) {
-		const struct memfd_luo_folio_ser *pfolio = &folios_ser[i];
-		phys_addr_t phys;
-		u64 index;
-		int flags;
+	err = kho_map_restore(&folios, folios_ser);
+	if (err) {
+		pr_err("failed to restore folios map: %pe\n", ERR_PTR(err));
+		return err;
+	}
 
-		if (!pfolio->pfn)
-			continue;
+	kho_map_for_each(&folios, index, entry.val) {
+		phys_addr_t phys = PFN_PHYS(entry.pfn);
+		unsigned long flags = entry.flags;
 
-		phys = PFN_PHYS(pfolio->pfn);
 		folio = kho_restore_folio(phys);
 		if (!folio) {
 			pr_err("Unable to restore folio at physical address: %llx\n",
@@ -514,8 +470,6 @@ static int memfd_luo_retrieve_folios(struct file *file,
 			err = -EIO;
 			goto put_folios;
 		}
-		index = pfolio->index;
-		flags = pfolio->flags;
 
 		/* Set up the folio for insertion. */
 		__folio_set_locked(folio);
@@ -523,16 +477,16 @@ static int memfd_luo_retrieve_folios(struct file *file,
 
 		err = mem_cgroup_charge(folio, NULL, mapping_gfp_mask(mapping));
 		if (err) {
-			pr_err("shmem: failed to charge folio index %ld: %d\n",
-			       i, err);
+			pr_err("shmem: failed to charge folio index %llu: %d\n",
+			       index, err);
 			goto unlock_folio;
 		}
 
 		err = shmem_add_to_page_cache(folio, mapping, index, NULL,
 					      mapping_gfp_mask(mapping));
 		if (err) {
-			pr_err("shmem: failed to add to page cache folio index %ld: %d\n",
-			       i, err);
+			pr_err("shmem: failed to add to page cache folio index %llu: %d\n",
+			       index, err);
 			goto unlock_folio;
 		}
 
@@ -544,8 +498,8 @@ static int memfd_luo_retrieve_folios(struct file *file,
 		npages = folio_nr_pages(folio);
 		err = shmem_inode_acct_blocks(inode, npages);
 		if (err) {
-			pr_err("shmem: failed to account folio index %ld(%ld pages): %d\n",
-			       i, npages, err);
+			pr_err("shmem: failed to account folio index %llu(%ld pages): %d\n",
+			       index, npages, err);
 			goto remove_from_cache;
 		}
 
@@ -556,6 +510,7 @@ static int memfd_luo_retrieve_folios(struct file *file,
 	}
 
 	shmem_recalc_inode(inode, nr_added_pages, 0);
+	kho_map_destroy(&folios);
 
 	return 0;
 
@@ -569,27 +524,16 @@ put_folios:
 	 * Note: don't free the folios already added to the file. They will be
 	 * freed when the file is freed. Free the ones not added yet here.
 	 */
-	for (long j = i + 1; j < nr_folios; j++) {
-		const struct memfd_luo_folio_ser *pfolio = &folios_ser[j];
-		phys_addr_t phys;
-
-		if (!pfolio->pfn)
-			continue;
-
-		phys = PFN_PHYS(pfolio->pfn);
-		folio = kho_restore_folio(phys);
-		if (folio)
-			folio_put(folio);
-	}
+	memfd_luo_discard_folios(&folios, index + 1);
 
 	shmem_recalc_inode(inode, nr_added_pages, 0);
+	kho_map_destroy(&folios);
 
 	return err;
 }
 
 static int memfd_luo_retrieve(struct liveupdate_file_op_args *args)
 {
-	struct memfd_luo_folio_ser *folios_ser;
 	struct memfd_luo_ser *ser;
 	struct file *file;
 	int err;
@@ -624,18 +568,9 @@ static int memfd_luo_retrieve(struct liveupdate_file_op_args *args)
 	vfs_setpos(file, ser->pos, MAX_LFS_FILESIZE);
 	i_size_write(file_inode(file), ser->size);
 
-	if (ser->nr_folios) {
-		folios_ser = kho_restore_vmalloc(&ser->folios);
-		if (!folios_ser) {
-			err = -EINVAL;
-			goto put_file;
-		}
-
-		err = memfd_luo_retrieve_folios(file, folios_ser, ser->nr_folios);
-		vfree(folios_ser);
-		if (err)
-			goto put_file;
-	}
+	err = memfd_luo_retrieve_folios(file, &ser->folios);
+	if (err)
+		goto put_file;
 
 	args->file = file;
 	kho_restore_free(ser);
