@@ -80,6 +80,7 @@
 #include <linux/shmem_fs.h>
 #include <linux/vmalloc.h>
 #include <linux/memfd.h>
+#include <linux/pagemap.h>
 #include <uapi/linux/memfd.h>
 
 #include "internal.h"
@@ -263,7 +264,6 @@ static int memfd_luo_preserve(struct liveupdate_file_op_args *args)
 	int err = 0, seals;
 
 	inode_lock(inode);
-	shmem_freeze(inode, true);
 
 	/* Allocate the main serialization structure in preserved memory */
 	ser = kho_alloc_preserve(sizeof(*ser));
@@ -304,6 +304,8 @@ static int memfd_luo_preserve(struct liveupdate_file_op_args *args)
 	if (err)
 		goto err_free_ser;
 
+	mapping_set_frozen(inode->i_mapping);
+
 	ser->nr_folios = nr_folios;
 	inode_unlock(inode);
 
@@ -315,7 +317,6 @@ static int memfd_luo_preserve(struct liveupdate_file_op_args *args)
 err_free_ser:
 	kho_unpreserve_free(ser);
 err_unlock:
-	shmem_freeze(inode, false);
 	inode_unlock(inode);
 	return err;
 }
@@ -347,7 +348,7 @@ static void memfd_luo_unpreserve(struct liveupdate_file_op_args *args)
 		return;
 
 	inode_lock(inode);
-	shmem_freeze(inode, false);
+	mapping_clear_frozen(inode->i_mapping);
 
 	ser = phys_to_virt(args->serialized_data);
 

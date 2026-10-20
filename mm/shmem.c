@@ -1363,8 +1363,6 @@ static int shmem_setattr(struct mnt_idmap *idmap,
 			return -EPERM;
 
 		if (newsize != oldsize) {
-			if (info->flags & SHMEM_F_MAPPING_FROZEN)
-				return -EPERM;
 			error = shmem_reacct_size(SHMEM_I(inode)->flags,
 					oldsize, newsize);
 			if (error)
@@ -3277,10 +3275,6 @@ shmem_write_begin(const struct kiocb *iocb, struct address_space *mapping,
 			return -EPERM;
 	}
 
-	if (unlikely((info->flags & SHMEM_F_MAPPING_FROZEN) &&
-		     pos + len > inode->i_size))
-		return -EPERM;
-
 	ret = shmem_get_folio(inode, index, pos + len, &folio, SGP_WRITE);
 	if (ret)
 		return ret;
@@ -3655,8 +3649,12 @@ static long shmem_fallocate(struct file *file, int mode, loff_t offset,
 
 	inode_lock(inode);
 
-	if (info->flags & SHMEM_F_MAPPING_FROZEN) {
-		error = -EPERM;
+	/*
+	 * vfs_fallocate() only does an early check without i_rwsem. Re-check
+	 * under it, since the mapping might have been frozen in the meantime.
+	 */
+	if (mapping_frozen(inode->i_mapping)) {
+		error = -EBUSY;
 		goto out;
 	}
 
