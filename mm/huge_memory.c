@@ -3889,6 +3889,10 @@ int folio_check_splittable(struct folio *folio, unsigned int new_order,
 	if (!folio->mapping && !folio_test_anon(folio))
 		return -EBUSY;
 
+	/* Splitting would change a frozen mapping. */
+	if (!folio_test_anon(folio) && mapping_frozen(folio->mapping))
+		return -EBUSY;
+
 	/* order-1 is not supported for anonymous THP. */
 	if (folio_test_anon(folio) && new_order == 1)
 		return -EINVAL;
@@ -3936,6 +3940,14 @@ static int __folio_freeze_and_split_unmapped(struct folio *folio, unsigned int n
 	int ret = 0;
 
 	VM_WARN_ON_ONCE(!mapping && end);
+
+	/*
+	 * Splitting changes the i_pages of the mapping, which is not allowed
+	 * if it is frozen.
+	 */
+	if (mapping && mapping_frozen(mapping))
+		return -EBUSY;
+
 	/*
 	 * If this folio can be on the deferred split queue, lock out
 	 * the shrinker before freezing the ref. If the shrinker sees
