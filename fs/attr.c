@@ -16,6 +16,7 @@
 #include <linux/fcntl.h>
 #include <linux/filelock.h>
 #include <linux/security.h>
+#include <linux/pagemap.h>
 
 /**
  * setattr_should_drop_sgid - determine whether the setgid bit needs to be
@@ -536,6 +537,13 @@ int notify_change(struct mnt_idmap *idmap, struct dentry *dentry,
 	if (!(ia_valid & ATTR_GID) &&
 	    !vfsgid_valid(i_gid_into_vfsgid(idmap, inode)))
 		return -EOVERFLOW;
+
+	/*
+	 * Changing the size of a frozen mapping is not allowed. This includes
+	 * truncating to the same size, since that drops folios beyond EOF.
+	 */
+	if ((ia_valid & ATTR_SIZE) && mapping_frozen(inode->i_mapping))
+		return -EBUSY;
 
 	error = security_inode_setattr(idmap, dentry, attr);
 	if (error)

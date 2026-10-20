@@ -304,6 +304,15 @@ int vfs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 		return -ETXTBSY;
 
 	/*
+	 * No fallocate operation is allowed on a frozen mapping. This check is
+	 * done without the filesystem's locks, so it is only an early bail out.
+	 * Filesystems supporting frozen mappings must re-check under the lock
+	 * that serializes their ->fallocate() against freezing.
+	 */
+	if (mapping_frozen(inode->i_mapping))
+		return -EBUSY;
+
+	/*
 	 * Revalidate the write permissions, in case security policy has
 	 * changed since the files were opened.
 	 */
