@@ -2,7 +2,8 @@
 
 kho-y :=								\
 		kexec_handover.o				\
-		kho_block.o
+		kho_block.o						\
+		xarray.o
 
 kho-$(CONFIG_KEXEC_HANDOVER_DEBUGFS) += kexec_handover_debugfs.o
 

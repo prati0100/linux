@@ -33,6 +33,11 @@ KHO serialization block ABI
 
 .. kernel-doc:: include/linux/kho/abi/block.h
 
+KHO xarray ABI
+==============
+
+.. kernel-doc:: include/linux/kho/abi/xarray.h
+
 See Also
 ========
 
