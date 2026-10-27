@@ -100,8 +100,8 @@ static int kho_map_restore_folio(void *node)
 }
 
 static void __kho_map_destroy_node(struct kho_map *map,
-				  struct kho_map_node_ser *node,
-				  unsigned int level)
+				   struct kho_map_node_ser *node,
+				   unsigned int level)
 {
 	unsigned int i;
 
@@ -143,7 +143,7 @@ void kho_map_destroy(struct kho_map *map)
 
 /* Unpreserve @node and everything below it. */
 static void __kho_map_unpreserve_node(struct kho_map_node_ser *node,
-				     unsigned int level)
+				      unsigned int level)
 {
 	unsigned int i;
 
@@ -163,7 +163,7 @@ static void __kho_map_unpreserve_node(struct kho_map_node_ser *node,
  * preserved is unpreserved again.
  */
 static int __kho_map_preserve_node(struct kho_map_node_ser *node,
-				  unsigned int level)
+				   unsigned int level)
 {
 	unsigned int i, j;
 	int err;
@@ -242,8 +242,8 @@ int kho_map_preserve(struct kho_map *map)
  * drop its reference to @node. Nodes that could not be restored are leaked.
  */
 static int __kho_map_restore_node(struct kho_map *map,
-				 struct kho_map_node_ser *node,
-				 unsigned int level)
+				  struct kho_map_node_ser *node,
+				  unsigned int level)
 {
 	unsigned int i, j;
 	int err;

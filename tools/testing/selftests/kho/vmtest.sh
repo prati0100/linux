@@ -119,6 +119,8 @@ function run_qemu() {
 		  -initrd "$initrd"
 
 	grep "KHO restore succeeded" "$serial" &> /dev/null || fail "KHO failed"
+	grep "KHO map restore succeeded" "$serial" &> /dev/null || \
+		fail "KHO map failed"
 }
 
 function target_to_arch() {
