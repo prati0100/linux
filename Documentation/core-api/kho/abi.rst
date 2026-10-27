@@ -33,6 +33,11 @@ KHO serialization block ABI
 
 .. kernel-doc:: include/linux/kho/abi/block.h
 
+KHO map ABI
+===========
+
+.. kernel-doc:: include/linux/kho/abi/map.h
+
 See Also
 ========
 

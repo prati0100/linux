@@ -94,6 +94,18 @@ KHO Serialization Blocks API
 .. kernel-doc:: kernel/liveupdate/kho_block.c
   :internal:
 
+KHO map
+=======
+
+.. kernel-doc:: kernel/liveupdate/kho_map.c
+  :doc: KHO map
+
+.. kernel-doc:: include/linux/kho_map.h
+  :identifiers: kho_map kho_map_clear kho_map_for_each_from kho_map_for_each
+
+.. kernel-doc:: kernel/liveupdate/kho_map.c
+  :internal:
+
 See Also
 ========
 
