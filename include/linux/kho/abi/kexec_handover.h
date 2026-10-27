@@ -132,6 +132,11 @@
 		(dest).phys = virt_to_phys(v);    \
 	})
 
+#define KHOSER_CLEAR_PTR(dest)			\
+	({					\
+		(dest).phys = 0;		\
+	})
+
 /* Loads the stored physical address back to a pointer. */
 #define KHOSER_LOAD_PTR(src)						\
 	({                                                                   \
