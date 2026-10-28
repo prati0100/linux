@@ -148,6 +148,40 @@ static int memfd_luo_migrate_folio(struct folio *folio)
 	return 0;
 }
 
+/*
+ * Look up the folio at @index, allocating it if needed, and make sure it can be
+ * held until the next kernel. Folios that are not longterm pinnable are migrated
+ * out first, retrying a few times if someone else has them isolated.
+ *
+ * On success, returns 0 with *@foliop locked and holding a reference.
+ */
+static int memfd_luo_get_folio(struct inode *inode, pgoff_t index,
+			       struct folio **foliop)
+{
+	int err, busy_retries = 0;
+	struct folio *folio;
+
+	for (;;) {
+		err = shmem_get_folio(inode, index, 0, &folio, SGP_CACHE);
+		if (err)
+			return err;
+
+		if (likely(folio_is_longterm_pinnable(folio)))
+			break;
+
+		folio_unlock(folio);
+		err = memfd_luo_migrate_folio(folio);
+		/* Someone else might have it isolated, retry a bit. */
+		if (err == -EBUSY && ++busy_retries < MEMFD_LUO_MIGRATE_RETRIES)
+			continue;
+		if (err)
+			return err;
+	}
+
+	*foliop = folio;
+	return 0;
+}
+
 static int memfd_luo_preserve_folio(struct folio *folio,
 				    struct memfd_luo_folio_ser *pfolio)
 {
@@ -193,9 +227,9 @@ static int memfd_luo_preserve_folios(struct file *file,
 	struct memfd_luo_folio_ser *folios_ser, *shrunk;
 	struct inode *inode = file_inode(file);
 	u64 nr_folios = 0, max_folios;
-	int err, busy_retries = 0;
 	unsigned int pin_flags;
 	pgoff_t index = 0, end;
+	int err;
 	loff_t size;
 
 	size = i_size_read(inode);
@@ -244,20 +278,9 @@ static int memfd_luo_preserve_folios(struct file *file,
 			goto err_restore;
 		}
 
-		err = shmem_get_folio(inode, index, 0, &folio, SGP_CACHE);
+		err = memfd_luo_get_folio(inode, index, &folio);
 		if (err)
 			goto err_restore;
-
-		if (unlikely(!folio_is_longterm_pinnable(folio))) {
-			folio_unlock(folio);
-			err = memfd_luo_migrate_folio(folio);
-			/* Someone else might have it isolated, retry a bit. */
-			if (err == -EBUSY && ++busy_retries < MEMFD_LUO_MIGRATE_RETRIES)
-				continue;
-			if (err)
-				goto err_restore;
-			continue;
-		}
 
 		err = memfd_luo_preserve_folio(folio, &folios_ser[nr_folios]);
 		index = folio_next_index(folio);
@@ -267,7 +290,6 @@ static int memfd_luo_preserve_folios(struct file *file,
 			goto err_restore;
 		}
 		nr_folios++;
-		busy_retries = 0;
 	}
 	memalloc_pin_restore(pin_flags);
 
