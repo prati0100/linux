@@ -1654,4 +1654,20 @@ static inline bool can_spin_trylock(void)
 	return true;
 }
 
+#ifdef CONFIG_LIVEUPDATE_MEMFD
+int memfd_luo_track_folio(struct inode *inode, struct folio *folio);
+void memfd_luo_untrack_removed(struct inode *inode, pgoff_t start, pgoff_t end);
+#else
+static inline int memfd_luo_track_folio(struct inode *inode,
+					struct folio *folio)
+{
+	return 0;
+}
+
+static inline void memfd_luo_untrack_removed(struct inode *inode,
+					     pgoff_t start, pgoff_t end)
+{
+}
+#endif /* CONFIG_LIVEUPDATE_MEMFD */
+
 #endif	/* __MM_INTERNAL_H */

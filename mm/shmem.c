@@ -286,6 +286,29 @@ bool vma_is_anon_shmem(const struct vm_area_struct *vma)
 	return vma->vm_ops == &shmem_anon_vm_ops;
 }
 
+/*
+ * Tell memfd_luo about a folio newly added to the page cache of @inode. Must be
+ * called with the folio locked, after the last point where it can be removed
+ * again on error.
+ */
+static int shmem_luo_track_folio(struct inode *inode, struct folio *folio)
+{
+	if (likely(!shmem_luo_preserved(inode)))
+		return 0;
+	return memfd_luo_track_folio(inode, folio);
+}
+
+/*
+ * Tell memfd_luo that folios in [@start, @end) might have been removed from the
+ * page cache of @inode.
+ */
+static void shmem_luo_untrack_removed(struct inode *inode, pgoff_t start,
+				      pgoff_t end)
+{
+	if (unlikely(shmem_luo_preserved(inode)))
+		memfd_luo_untrack_removed(inode, start, end);
+}
+
 bool vma_is_shmem(const struct vm_area_struct *vma)
 {
 	return vma_is_anon_shmem(vma) || vma->vm_ops == &shmem_vm_ops;
@@ -1124,6 +1147,8 @@ static void shmem_undo_range(struct inode *inode, loff_t lstart, uoff_t lend,
 	struct shmem_inode_info *info = SHMEM_I(inode);
 	pgoff_t start = (lstart + PAGE_SIZE - 1) >> PAGE_SHIFT;
 	pgoff_t end = (lend + 1) >> PAGE_SHIFT;
+	pgoff_t luo_start = lstart >> PAGE_SHIFT;
+	pgoff_t luo_end;
 	struct folio_batch fbatch;
 	pgoff_t indices[FOLIO_BATCH_SIZE];
 	struct folio *folio;
@@ -1134,6 +1159,7 @@ static void shmem_undo_range(struct inode *inode, loff_t lstart, uoff_t lend,
 
 	if (lend == -1)
 		end = -1;	/* unsigned, so actually very big */
+	luo_end = end;
 
 	if (info->fallocend > start && info->fallocend <= end && !unfalloc)
 		info->fallocend = start;
@@ -1282,6 +1308,7 @@ whole_folios:
 	}
 
 	shmem_recalc_inode(inode, 0, -nr_swaps_freed);
+	shmem_luo_untrack_removed(inode, luo_start, luo_end);
 }
 
 void shmem_truncate_range(struct inode *inode, loff_t lstart, uoff_t lend)
@@ -1355,8 +1382,6 @@ static int shmem_setattr(struct mnt_idmap *idmap,
 			return -EPERM;
 
 		if (newsize != oldsize) {
-			if (info->flags & SHMEM_F_MAPPING_FROZEN)
-				return -EPERM;
 			error = shmem_reacct_size(SHMEM_I(inode)->flags,
 					oldsize, newsize);
 			if (error)
@@ -1928,6 +1953,13 @@ static struct folio *shmem_alloc_folio(gfp_t gfp, int order,
 	struct mempolicy *mpol;
 	pgoff_t ilx;
 	struct folio *folio;
+
+	/*
+	 * Folios of a preserved inode are held until the next kernel, so keep
+	 * them out of ZONE_MOVABLE and CMA.
+	 */
+	if (unlikely(info->flags & SHMEM_F_LUO_PRESERVED))
+		gfp &= ~__GFP_MOVABLE;
 
 	mpol = shmem_get_pgoff_policy(info, index, order, &ilx);
 	folio = folio_alloc_mpol(gfp, order, mpol, ilx, numa_node_id());
@@ -2562,8 +2594,12 @@ alloced:
 		folio_set_referenced(folio);
 	/*
 	 * Let SGP_FALLOC use the SGP_WRITE optimization on a new folio.
+	 *
+	 * Not for preserved inodes though: memfd_luo records every folio as
+	 * uptodate and would hand the uncleared folio over to the next kernel.
+	 * The downside is that a failed fallocate() can't undo these anymore.
 	 */
-	if (sgp == SGP_FALLOC)
+	if (sgp == SGP_FALLOC && !shmem_luo_preserved(inode))
 		sgp = SGP_WRITE;
 clear:
 	/*
@@ -2585,6 +2621,21 @@ clear:
 	    ((loff_t)index << PAGE_SHIFT) >= i_size_read(inode)) {
 		error = -EINVAL;
 		goto unlock;
+	}
+
+	/* Must be last, nothing can remove the folio after it is tracked. */
+	if (alloced) {
+		error = shmem_luo_track_folio(inode, folio);
+		if (error == -EAGAIN) {
+			/* Allocated before the inode was preserved, retry. */
+			filemap_remove_folio(folio);
+			shmem_recalc_inode(inode, 0, 0);
+			folio_unlock(folio);
+			folio_put(folio);
+			goto repeat;
+		}
+		if (error)
+			goto unlock;
 	}
 out:
 	*foliop = folio;
@@ -3186,11 +3237,17 @@ static int shmem_mfill_filemap_add(struct folio *folio,
 		goto err_delete_from_cache;
 	}
 
+	err = shmem_luo_track_folio(inode, folio);
+	if (err)
+		goto err_unacct;
+
 	folio_add_lru(folio);
 	shmem_recalc_inode(inode, 1, 0);
 
 	return 0;
 
+err_unacct:
+	shmem_inode_unacct_blocks(inode, 1);
 err_delete_from_cache:
 	filemap_remove_folio(folio);
 err_unlock:
@@ -3204,6 +3261,7 @@ static void shmem_mfill_filemap_remove(struct folio *folio,
 	struct inode *inode = file_inode(vma->vm_file);
 
 	filemap_remove_folio(folio);
+	shmem_luo_untrack_removed(inode, folio->index, folio->index + 1);
 	shmem_recalc_inode(inode, 0, 0);
 	folio_unlock(folio);
 }
@@ -3257,10 +3315,6 @@ shmem_write_begin(const struct kiocb *iocb, struct address_space *mapping,
 		if ((info->seals & F_SEAL_GROW) && pos + len > inode->i_size)
 			return -EPERM;
 	}
-
-	if (unlikely((info->flags & SHMEM_F_MAPPING_FROZEN) &&
-		     pos + len > inode->i_size))
-		return -EPERM;
 
 	ret = shmem_get_folio(inode, index, pos + len, &folio, SGP_WRITE);
 	if (ret)
@@ -3635,11 +3689,6 @@ static long shmem_fallocate(struct file *file, int mode, loff_t offset,
 		return -EOPNOTSUPP;
 
 	inode_lock(inode);
-
-	if (info->flags & SHMEM_F_MAPPING_FROZEN) {
-		error = -EPERM;
-		goto out;
-	}
 
 	if (mode & FALLOC_FL_PUNCH_HOLE) {
 		struct address_space *mapping = file->f_mapping;

@@ -36,11 +36,14 @@
  * The following properties of the memfd are preserved across kexec:
  *
  * File Contents
- *   All data stored in the file is preserved.
+ *   All data stored in the file is preserved. The file stays fully usable after
+ *   preservation. Folios added to the file later, e.g. by faulting in a hole,
+ *   writing to it, or ``fallocate()``, are preserved as well. Folios removed by
+ *   truncation or hole punching are no longer preserved.
  *
  * File Size
- *   The size of the file is preserved. Holes in the file are filled by
- *   allocating pages for them during preservation.
+ *   The size of the file at freeze time is preserved. Holes in the file are
+ *   not filled and stay holes in the next kernel.
  *
  * File Position
  *   The current file position is preserved, allowing applications to continue
@@ -87,6 +90,47 @@
 #include <uapi/linux/memfd.h>
 
 #include "internal.h"
+
+/**
+ * struct memfd_luo_private - Runtime state of a preserved memfd.
+ * @lock:   Serializes all access to @folios, and protects @dead.
+ * @folios: The KHO xarray tracking the preserved folios of the file.
+ * @ref:    Reference count. Hooks called from shmem hold a reference while they
+ *          use the struct.
+ * @dead:   The file has been unpreserved and @folios is gone.
+ *
+ * shmem calls memfd_luo_track_folio() and memfd_luo_untrack_removed() when a
+ * preserved inode gains or loses folios. Those find this struct by looking up
+ * the inode in memfd_luo_inodes.
+ */
+struct memfd_luo_private {
+	struct mutex lock;
+	struct kho_xarray *folios;
+	refcount_t ref;
+	bool dead;
+};
+
+/* Maps inodes of preserved memfds to their struct memfd_luo_private. */
+static DEFINE_XARRAY(memfd_luo_inodes);
+
+static struct memfd_luo_private *memfd_luo_get_private(struct inode *inode)
+{
+	struct memfd_luo_private *priv;
+
+	xa_lock(&memfd_luo_inodes);
+	priv = xa_load(&memfd_luo_inodes, (unsigned long)inode);
+	if (priv)
+		refcount_inc(&priv->ref);
+	xa_unlock(&memfd_luo_inodes);
+
+	return priv;
+}
+
+static void memfd_luo_put_private(struct memfd_luo_private *priv)
+{
+	if (refcount_dec_and_test(&priv->ref))
+		kfree(priv);
+}
 
 static void memfd_luo_put_folios(struct kho_xarray *kxa)
 {
@@ -149,7 +193,14 @@ static int memfd_luo_get_folio(struct inode *inode, pgoff_t index,
 	struct folio *folio;
 
 	for (;;) {
-		err = shmem_get_folio(inode, index, 0, &folio, SGP_CACHE);
+		/*
+		 * SGP_FALLOC doesn't stop at i_size, so folios fallocated
+		 * beyond EOF are found too. It also clears fallocated folios
+		 * that are not uptodate yet. This is only called for indices
+		 * that have an entry, so it only allocates if the entry went
+		 * away in the meantime. Such a folio is tracked like any other.
+		 */
+		err = shmem_get_folio(inode, index, 0, &folio, SGP_FALLOC);
 		if (err)
 			return err;
 
@@ -169,10 +220,23 @@ static int memfd_luo_get_folio(struct inode *inode, pgoff_t index,
 	return 0;
 }
 
+/*
+ * Preserve a locked folio and add it to @kxa. On success, @kxa holds its own
+ * reference to the folio. Folios that are already tracked are left alone.
+ *
+ * Must be called with the lock of the owning struct memfd_luo_private held.
+ */
 static int memfd_luo_preserve_folio(struct folio *folio, struct kho_xarray *kxa)
 {
 	union memfd_luo_folio_ser entry = {};
 	int err;
+
+	entry.val = kho_xa_get(kxa, folio->index);
+	if (entry.val) {
+		/* Tracked folios hold a reference, so they can't be replaced. */
+		WARN_ON_ONCE(entry.pfn != folio_pfn(folio));
+		return 0;
+	}
 
 	err = kho_preserve_folio(folio);
 	if (err)
@@ -199,6 +263,10 @@ static int memfd_luo_preserve_folio(struct folio *folio, struct kho_xarray *kxa)
 	 */
 	folio_mark_dirty(folio);
 
+	/*
+	 * The folio might not be uptodate yet when it was just allocated for a
+	 * write. The writer makes it uptodate before unlocking it.
+	 */
 	entry.pfn = folio_pfn(folio);
 	entry.flags = MEMFD_LUO_FOLIO_DIRTY | MEMFD_LUO_FOLIO_UPTODATE;
 	err = kho_xa_set(kxa, folio->index, entry.val);
@@ -207,84 +275,180 @@ static int memfd_luo_preserve_folio(struct folio *folio, struct kho_xarray *kxa)
 		return err;
 	}
 
+	folio_get(folio);
 	return 0;
 }
 
-static int memfd_luo_preserve_folios(struct file *file, struct kho_xarray *kxa)
+/**
+ * memfd_luo_track_folio() - Track a folio newly added to a preserved memfd.
+ * @inode: The inode of the memfd.
+ * @folio: The locked folio, already in the page cache of @inode.
+ *
+ * Called by shmem after a folio was added to the page cache of an inode marked
+ * with SHMEM_F_LUO_PRESERVED, e.g. when a hole is faulted in. Must be called
+ * after the last point where shmem might remove the folio again on error.
+ *
+ * Return: 0 on success, -EAGAIN if the folio can't be held until the next
+ * kernel and the caller should remove it and allocate a new one, or another
+ * -errno on failure.
+ */
+int memfd_luo_track_folio(struct inode *inode, struct folio *folio)
 {
-	struct inode *inode = file_inode(file);
-	unsigned int pin_flags;
-	pgoff_t index = 0, end;
-	int err;
-	loff_t size;
+	struct memfd_luo_private *priv;
+	int err = 0;
 
-	kho_xa_init(kxa);
-
-	size = i_size_read(inode);
-	/* If the file has zero size, then the folios xarray is left empty. */
-	if (!size)
+	priv = memfd_luo_get_private(inode);
+	if (!priv)
 		return 0;
 
-	end = DIV_ROUND_UP_ULL(size, PAGE_SIZE);
+	/*
+	 * shmem doesn't allocate from ZONE_MOVABLE or CMA for preserved
+	 * inodes, but this folio might have been allocated before the inode
+	 * got preserved.
+	 */
+	if (unlikely(!folio_is_longterm_pinnable(folio))) {
+		err = -EAGAIN;
+		goto out;
+	}
+
+	mutex_lock(&priv->lock);
+	if (!priv->dead)
+		err = memfd_luo_preserve_folio(folio, priv->folios);
+	mutex_unlock(&priv->lock);
+
+out:
+	memfd_luo_put_private(priv);
+	return err;
+}
+
+/**
+ * memfd_luo_untrack_removed() - Stop tracking folios removed from a memfd.
+ * @inode: The inode of the memfd.
+ * @start: First index to check.
+ * @end:   Index after the last one to check.
+ *
+ * Called by shmem after folios in [@start, @end) might have been removed from
+ * the page cache of an inode marked with SHMEM_F_LUO_PRESERVED, e.g. by
+ * truncation or hole punching. Tracked folios that are no longer in the page
+ * cache are unpreserved and their reference is dropped.
+ *
+ * Tracked folios hold a reference, so they can't be split. A large folio is
+ * thus either removed as a whole, or not at all.
+ */
+void memfd_luo_untrack_removed(struct inode *inode, pgoff_t start, pgoff_t end)
+{
+	struct memfd_luo_private *priv;
+	union memfd_luo_folio_ser entry;
+	u64 index;
+
+	priv = memfd_luo_get_private(inode);
+	if (!priv)
+		return;
+
+	mutex_lock(&priv->lock);
+	if (priv->dead)
+		goto out;
+
+	kho_xa_for_each_from(priv->folios, index, entry.val, start) {
+		struct folio *folio = pfn_folio(entry.pfn);
+
+		if (index >= end)
+			break;
+
+		/* The reference keeps the folio from going away or getting reused. */
+		if (READ_ONCE(folio->mapping) == inode->i_mapping)
+			continue;
+
+		kho_xa_clear(priv->folios, index);
+		kho_unpreserve_folio(folio);
+		folio_put(folio);
+	}
+
+out:
+	mutex_unlock(&priv->lock);
+	memfd_luo_put_private(priv);
+}
+
+static int memfd_luo_preserve_folios(struct file *file,
+				     struct memfd_luo_private *priv)
+{
+	struct inode *inode = file_inode(file);
+	struct address_space *mapping = inode->i_mapping;
+	unsigned int pin_flags;
+	pgoff_t index = 0;
+	int err = 0;
 
 	/*
 	 * The folios are held until the next kernel, so keep newly allocated
-	 * ones out of ZONE_MOVABLE and CMA -- which also ensures they don't
-	 * fall in KHO bootmem. Existing ones are migrated below.
+	 * ones (e.g. on swapin) out of ZONE_MOVABLE and CMA -- which also
+	 * ensures they don't fall in KHO bootmem. Existing ones are migrated
+	 * below.
 	 *
-	 * A side effect of this is that it allocates a folio for all indices in
-	 * the file. This might waste memory on sparse memfds. If that is really
-	 * a problem in the future, this loop can be taught to skip empty slots.
+	 * Only walk the entries that exist. Holes stay holes, folios that get
+	 * added to them from now on are tracked by memfd_luo_track_folio().
+	 * Those might show up in this walk too, memfd_luo_preserve_folio()
+	 * skips them.
 	 */
 	pin_flags = memalloc_pin_save();
-	while (index < end) {
+	while (xa_find(&mapping->i_pages, &index, ULONG_MAX, XA_PRESENT)) {
 		struct folio *folio;
 
 		cond_resched();
 
 		if (fatal_signal_pending(current)) {
 			err = -EINTR;
-			goto err_restore;
+			break;
 		}
 
 		err = memfd_luo_get_folio(inode, index, &folio);
 		if (err)
-			goto err_restore;
+			break;
 
-		err = memfd_luo_preserve_folio(folio, kxa);
+		mutex_lock(&priv->lock);
+		err = memfd_luo_preserve_folio(folio, priv->folios);
+		mutex_unlock(&priv->lock);
+
 		index = folio_next_index(folio);
 		folio_unlock(folio);
-		if (err) {
-			folio_put(folio);
-			goto err_restore;
-		}
+		folio_put(folio);
+		/* Reached the end of the index space. */
+		if (err || !index)
+			break;
 	}
 	memalloc_pin_restore(pin_flags);
 
-	return 0;
-
-err_restore:
-	memalloc_pin_restore(pin_flags);
-	memfd_luo_put_folios(kxa);
-	kho_xa_destroy(kxa);
 	return err;
 }
 
-static void memfd_luo_unpreserve_folios(struct kho_xarray *kxa)
+/*
+ * Make shmem stop calling into memfd_luo for @inode, wait for the calls in
+ * flight, and drop all tracked folios.
+ *
+ * Must be called with the inode lock held.
+ */
+static void memfd_luo_stop_tracking(struct inode *inode,
+				    struct memfd_luo_private *priv)
 {
-	memfd_luo_put_folios(kxa);
-	kho_xa_destroy(kxa);
+	shmem_set_luo_preserved(inode, false);
+	xa_erase(&memfd_luo_inodes, (unsigned long)inode);
+
+	mutex_lock(&priv->lock);
+	priv->dead = true;
+	memfd_luo_put_folios(priv->folios);
+	kho_xa_destroy(priv->folios);
+	mutex_unlock(&priv->lock);
+
+	memfd_luo_put_private(priv);
 }
 
 static int memfd_luo_preserve(struct liveupdate_file_op_args *args)
 {
 	struct inode *inode = file_inode(args->file);
+	struct memfd_luo_private *priv;
 	struct memfd_luo_ser *ser;
-	u64 inode_size;
 	int err = 0, seals;
 
 	inode_lock(inode);
-	shmem_freeze(inode, true);
 
 	/* Allocate the main serialization structure in preserved memory */
 	ser = kho_alloc_preserve(sizeof(*ser));
@@ -305,26 +469,49 @@ static int memfd_luo_preserve(struct liveupdate_file_op_args *args)
 		goto err_free_ser;
 	}
 
-	ser->pos = args->file->f_pos;
-	inode_size = i_size_read(inode);
-
-	ser->size = inode_size;
 	ser->seals = seals;
+	kho_xa_init(&ser->folios);
 
-	err = memfd_luo_preserve_folios(args->file, &ser->folios);
-	if (err)
+	priv = kzalloc_obj(*priv);
+	if (!priv) {
+		err = -ENOMEM;
 		goto err_free_ser;
+	}
+
+	mutex_init(&priv->lock);
+	refcount_set(&priv->ref, 1);
+	priv->folios = &ser->folios;
+
+	err = xa_insert(&memfd_luo_inodes, (unsigned long)inode, priv,
+			GFP_KERNEL);
+	if (err) {
+		kfree(priv);
+		goto err_free_ser;
+	}
+
+	/* From here on, shmem reports new folios to memfd_luo_track_folio(). */
+	shmem_set_luo_preserved(inode, true);
+
+	err = memfd_luo_preserve_folios(args->file, priv);
+	if (err)
+		goto err_stop_tracking;
+
+	/* Updated again at freeze(), the file can still change until then. */
+	ser->pos = args->file->f_pos;
+	ser->size = i_size_read(inode);
 
 	inode_unlock(inode);
 
 	args->serialized_data = virt_to_phys(ser);
+	args->private_data = priv;
 
 	return 0;
 
+err_stop_tracking:
+	memfd_luo_stop_tracking(inode, priv);
 err_free_ser:
 	kho_unpreserve_free(ser);
 err_unlock:
-	shmem_freeze(inode, false);
 	inode_unlock(inode);
 	return err;
 }
@@ -339,10 +526,11 @@ static int memfd_luo_freeze(struct liveupdate_file_op_args *args)
 	ser = phys_to_virt(args->serialized_data);
 
 	/*
-	 * The pos might have changed since prepare. Everything else stays the
-	 * same.
+	 * The pos and size might have changed since preserve. The folios are
+	 * kept up to date as they change.
 	 */
 	ser->pos = args->file->f_pos;
+	ser->size = i_size_read(file_inode(args->file));
 
 	return 0;
 }
@@ -355,13 +543,10 @@ static void memfd_luo_unpreserve(struct liveupdate_file_op_args *args)
 	if (WARN_ON_ONCE(!args->serialized_data))
 		return;
 
-	inode_lock(inode);
-	shmem_freeze(inode, false);
-
 	ser = phys_to_virt(args->serialized_data);
 
-	memfd_luo_unpreserve_folios(&ser->folios);
-
+	inode_lock(inode);
+	memfd_luo_stop_tracking(inode, args->private_data);
 	kho_unpreserve_free(ser);
 	inode_unlock(inode);
 }

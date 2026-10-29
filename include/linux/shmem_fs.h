@@ -23,13 +23,10 @@
 /* Disallow swapping. */
 #define SHMEM_F_LOCKED		BIT(1)
 /*
- * Disallow growing, shrinking, or hole punching in the inode. Combined with
- * folio pinning, makes sure the inode's mapping stays fixed.
- *
- * In some ways similar to F_SEAL_GROW | F_SEAL_SHRINK, but can be removed and
- * isn't directly visible to userspace.
+ * The inode is preserved for live update. Folios added to or removed from the
+ * page cache are reported to memfd_luo so it can keep track of them.
  */
-#define SHMEM_F_MAPPING_FROZEN	BIT(2)
+#define SHMEM_F_LUO_PRESERVED	BIT(2)
 
 struct shmem_inode_info {
 	spinlock_t		lock;
@@ -196,13 +193,28 @@ static inline bool shmem_file(struct file *file)
 	return shmem_mapping(file->f_mapping);
 }
 
-/* Must be called with inode lock taken exclusive. */
-static inline void shmem_freeze(struct inode *inode, bool freeze)
+/*
+ * Must be called with inode lock taken exclusive.
+ *
+ * The flag is flipped under the i_pages lock. Code that adds a folio to the page
+ * cache and then checks the flag either sees it set, or the folio is visible to
+ * a page cache walk that starts after setting the flag.
+ */
+static inline void shmem_set_luo_preserved(struct inode *inode, bool preserved)
 {
-	if (freeze)
-		SHMEM_I(inode)->flags |= SHMEM_F_MAPPING_FROZEN;
+	struct address_space *mapping = inode->i_mapping;
+
+	xa_lock_irq(&mapping->i_pages);
+	if (preserved)
+		SHMEM_I(inode)->flags |= SHMEM_F_LUO_PRESERVED;
 	else
-		SHMEM_I(inode)->flags &= ~SHMEM_F_MAPPING_FROZEN;
+		SHMEM_I(inode)->flags &= ~SHMEM_F_LUO_PRESERVED;
+	xa_unlock_irq(&mapping->i_pages);
+}
+
+static inline bool shmem_luo_preserved(struct inode *inode)
+{
+	return SHMEM_I(inode)->flags & SHMEM_F_LUO_PRESERVED;
 }
 
 /*
