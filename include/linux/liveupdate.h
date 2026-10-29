@@ -71,9 +71,11 @@ struct liveupdate_arg_spec {
  * @serialized_data:  The opaque u64 handle, preserve/prepare/freeze may update
  *                    this field.
  * @private_data:     Private data for the file used to hold runtime state that
- *                    is not preserved. Set by the handler's .preserve()
- *                    callback, and must be freed in the handler's
- *                    .unpreserve() callback.
+ *                    is not preserved. For outgoing, set by the handler's
+ *                    .preserve() callback, and must be freed in the handler's
+ *                    .unpreserve() callback. For incoming, set by the handler's
+ *                    .retrieve() callback on success, and must be freed in the
+ *                    handler's .finish() callback.
  * @arg:              Kernel copy of the user-provided argument for .preserve()
  *                    and .retrieve(), or %NULL if none was provided. Allocated
  *                    to the handler's expected argument size with any trailing
