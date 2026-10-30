@@ -50,8 +50,6 @@ static int hugetlb_flb_preserve(struct liveupdate_flb_op_args *args)
 		return -ENOMEM;
 	}
 
-	printk("hugetlb_ser: 0x%llx\n", virt_to_phys(hugetlb_ser));
-
 	spin_lock_init(&obj->lock);
 	obj->ser = hugetlb_ser;
 
