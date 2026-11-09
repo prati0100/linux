@@ -192,7 +192,7 @@ static bool hugetlb_luo_can_preserve(struct liveupdate_file_handler *handler,
 {
 	struct inode *inode = file_inode(file);
 
-	return is_file_hugepages(file) && !inode->i_nlink;
+	return is_file_hugetlbfs(file) && !inode->i_nlink;
 }
 
 static void hugetlb_luo_unpreserve_folio(struct hstate *h, struct folio *folio)
@@ -422,6 +422,15 @@ static int hugetlb_luo_preserve(struct liveupdate_file_op_args *args)
 	struct hugetlb_luo_ser *memfd_ser;
 	struct kho_map *folios;
 	int err;
+
+	/*
+	 * Preserving stops everyone from resizing the file or punching holes
+	 * in it until it is unpreserved. Only allow it to those who could write
+	 * to the file themselves.
+	 */
+	err = inode_permission(file_mnt_idmap(file), inode, MAY_WRITE);
+	if (err)
+		return err;
 
 	memfd_ser = kho_alloc_preserve(sizeof(*memfd_ser));
 	if (IS_ERR(memfd_ser))
