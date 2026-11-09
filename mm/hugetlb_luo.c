@@ -600,6 +600,21 @@ static void hugetlb_luo_discard_folios(struct kho_map *map, u64 start,
 	prep_and_add_allocated_folios(h, &folio_list);
 }
 
+/* Free all folios of a file that won't be retrieved, and @memfd_ser itself. */
+static void hugetlb_luo_discard(struct hugetlb_luo_ser *memfd_ser)
+{
+	struct kho_map folios;
+
+	if (kho_map_restore(&folios, &memfd_ser->folios)) {
+		pr_warn("unable to restore folios map\n");
+	} else {
+		hugetlb_luo_discard_folios(&folios, 0, memfd_ser->order);
+		kho_map_destroy(&folios);
+	}
+
+	kho_restore_free(memfd_ser);
+}
+
 /*
  * Drop the references retrieve() holds on the folios added to the file, for
  * keys below @end.
@@ -645,21 +660,11 @@ static void hugetlb_luo_finish(struct liveupdate_file_op_args *args)
 
 		kho_map_destroy(folios);
 		kfree(folios);
+		kho_restore_free(memfd_ser);
 	} else {
-		/* Retrieve was not called, discard the preserved folios. */
-		struct kho_map folios;
-
-		if (kho_map_restore(&folios, &memfd_ser->folios)) {
-			pr_warn("unable to restore folios map\n");
-			goto out;
-		}
-
-		hugetlb_luo_discard_folios(&folios, 0, memfd_ser->order);
-		kho_map_destroy(&folios);
+		/* The file was never retrieved, discard the preserved folios. */
+		hugetlb_luo_discard(memfd_ser);
 	}
-
-out:
-	kho_restore_free(memfd_ser);
 }
 
 /* Add the retrieved folios to the hstate as in-use folios. */
@@ -772,19 +777,19 @@ err_region_abort:
 }
 
 /*
- * @map must already be restored. It stays around until finish(), which drops
- * the references held on the folios.
+ * Add the folios in the restored @map to the empty file @inode, which has the
+ * preserved @size.
  *
  * On error, all the folios are released. The ones already added to the page
- * cache are freed when the file is released.
+ * cache only lose the reference held on them, and are freed when they are
+ * removed from the file.
  */
-static int hugetlb_luo_retrieve_folios(struct file *file,
-				       struct kho_map *map)
+static int hugetlb_luo_fill_file(struct inode *inode, struct kho_map *map,
+				 u64 size)
 {
-	struct inode *inode = file_inode(file);
 	struct hstate *h = hstate_inode(inode);
 	unsigned int order = huge_page_order(h);
-	u64 nr_hpages = DIV_ROUND_UP_ULL(i_size_read(inode), huge_page_size(h));
+	u64 nr_hpages = DIV_ROUND_UP_ULL(size, huge_page_size(h));
 	union hugetlb_luo_folio_ser entry;
 	struct folio *folio;
 	LIST_HEAD(list);
@@ -807,8 +812,10 @@ static int hugetlb_luo_retrieve_folios(struct file *file,
 	kho_map_for_each(map, index, entry.val) {
 		folio = hugetlb_luo_retrieve_folio(entry, order);
 		if (!folio) {
-			err = -EINVAL;
-			goto err_discard;
+			/* This one was not restored. Discard the ones after it. */
+			prep_and_add_allocated_folios(h, &list);
+			hugetlb_luo_discard_folios(map, index + 1, order);
+			return -EINVAL;
 		}
 
 		list_add(&folio->lru, &list);
@@ -842,65 +849,75 @@ err_release:
 	kho_map_for_each_from(map, index, entry.val, failed)
 		hugetlb_luo_free_uncached_folio(h, pfn_folio(entry.pfn));
 	return err;
-
-err_discard:
-	/* The folio at index was not restored. Discard the ones after it. */
-	prep_and_add_allocated_folios(h, &list);
-	hugetlb_luo_discard_folios(map, index + 1, order);
-	return err;
 }
 
-static int hugetlb_luo_retrieve(struct liveupdate_file_op_args *args)
+/*
+ * Restore the folios map of @memfd_ser and add the folios to @inode. This uses
+ * up the preserved state, so retrieve can't be retried after it.
+ */
+static struct kho_map *hugetlb_luo_retrieve_folios(struct inode *inode,
+						  struct hugetlb_luo_ser *memfd_ser)
 {
-	struct hugetlb_luo_ser *memfd_ser;
-	struct kho_map *folios;
-	unsigned int flags;
-	struct file *file;
+	struct kho_map *map;
 	int err;
 
-	if (!args->serialized_data)
-		return -EINVAL;
-
-	memfd_ser = phys_to_virt(args->serialized_data);
-
-	/*
-	 * The runtime handle of the folios map is needed until finish(), so
-	 * keep it in private_data.
-	 */
-	folios = kmalloc_obj(*folios);
-	if (!folios) {
-		err = -ENOMEM;
-		goto err_free_memfd_ser;
+	map = kmalloc_obj(*map);
+	if (!map) {
+		hugetlb_luo_discard(memfd_ser);
+		return ERR_PTR(-ENOMEM);
 	}
 
-	err = kho_map_restore(folios, &memfd_ser->folios);
+	err = kho_map_restore(map, &memfd_ser->folios);
 	if (err) {
 		pr_err("failed to restore folios map: %pe\n", ERR_PTR(err));
-		goto err_free_folios;
+		goto err_free_map;
 	}
 
-	if (memfd_ser->size > MAX_LFS_FILESIZE) {
-		err = -EINVAL;
-		goto err_discard_folios;
-	}
+	err = hugetlb_luo_fill_file(inode, map, memfd_ser->size);
+	if (err)
+		goto err_destroy_map;
+
+	return map;
+
+err_destroy_map:
+	kho_map_destroy(map);
+err_free_map:
+	kfree(map);
+	kho_restore_free(memfd_ser);
+	return ERR_PTR(err);
+}
+
+/* Check the preserved state for anything this kernel can't restore. */
+static int hugetlb_luo_check_ser(struct hugetlb_luo_ser *memfd_ser)
+{
+	if (memfd_ser->size > MAX_LFS_FILESIZE)
+		return -EINVAL;
 
 	if (!hugetlb_luo_order_hstate(memfd_ser->order)) {
 		pr_err("no hstate found for order %u\n", memfd_ser->order);
-		err = -ENODEV;
-		goto err_discard_folios;
+		return -ENODEV;
 	}
 
 	if (memfd_ser->flags) {
 		pr_err("unsupported flags 0x%x\n", memfd_ser->flags);
-		err = -EOPNOTSUPP;
-		goto err_discard_folios;
+		return -EOPNOTSUPP;
 	}
 
 	if (memfd_ser->seals & ~HUGETLB_LUO_ALL_SEALS) {
 		pr_err("unsupported seals 0x%x\n", memfd_ser->seals);
-		err = -EOPNOTSUPP;
-		goto err_discard_folios;
+		return -EOPNOTSUPP;
 	}
+
+	return 0;
+}
+
+static int hugetlb_luo_retrieve_memfd(struct liveupdate_file_op_args *args,
+				      struct hugetlb_luo_ser *memfd_ser)
+{
+	struct kho_map *folios;
+	unsigned int flags;
+	struct file *file;
+	int err;
 
 	/* Allow sealing so the preserved seals can be added. */
 	flags = MFD_HUGETLB | MFD_ALLOW_SEALING;
@@ -908,14 +925,13 @@ static int hugetlb_luo_retrieve(struct liveupdate_file_op_args *args)
 	file = memfd_alloc_file("", flags);
 	if (IS_ERR(file)) {
 		err = PTR_ERR(file);
-		goto err_discard_folios;
+		goto err_discard;
 	}
 
 	err = memfd_add_seals(file, memfd_ser->seals);
 	if (err) {
 		pr_err("failed to add seals: %pe\n", ERR_PTR(err));
-		fput(file);
-		goto err_discard_folios;
+		goto err_fput;
 	}
 
 	vfs_setpos(file, memfd_ser->pos, MAX_LFS_FILESIZE);
@@ -932,11 +948,10 @@ static int hugetlb_luo_retrieve(struct liveupdate_file_op_args *args)
 	hugetlb_i_freeze(file_inode(file), true);
 	inode_unlock(file_inode(file));
 
-	err = hugetlb_luo_retrieve_folios(file, folios);
-	if (err) {
-		/* hugetlb_luo_retrieve_folios() released the folios. */
+	folios = hugetlb_luo_retrieve_folios(file_inode(file), memfd_ser);
+	if (IS_ERR(folios)) {
 		fput(file);
-		goto err_destroy_map;
+		return PTR_ERR(folios);
 	}
 
 	/* memfd_ser and the folios map are freed in finish(). */
@@ -944,15 +959,30 @@ static int hugetlb_luo_retrieve(struct liveupdate_file_op_args *args)
 	args->private_data = folios;
 	return 0;
 
-err_discard_folios:
-	hugetlb_luo_discard_folios(folios, 0, memfd_ser->order);
-err_destroy_map:
-	kho_map_destroy(folios);
-err_free_folios:
-	kfree(folios);
-err_free_memfd_ser:
-	kho_restore_free(memfd_ser);
+err_fput:
+	fput(file);
+err_discard:
+	hugetlb_luo_discard(memfd_ser);
 	return err;
+}
+
+static int hugetlb_luo_retrieve(struct liveupdate_file_op_args *args)
+{
+	struct hugetlb_luo_ser *memfd_ser;
+	int err;
+
+	if (!args->serialized_data)
+		return -EINVAL;
+
+	memfd_ser = phys_to_virt(args->serialized_data);
+
+	err = hugetlb_luo_check_ser(memfd_ser);
+	if (err) {
+		hugetlb_luo_discard(memfd_ser);
+		return err;
+	}
+
+	return hugetlb_luo_retrieve_memfd(args, memfd_ser);
 }
 
 static unsigned long hugetlb_luo_get_id(struct file *file)
