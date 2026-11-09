@@ -526,6 +526,10 @@ static inline bool is_file_hugepages(const struct file *file)
 	return file->f_op->fop_flags & FOP_HUGE_PAGES;
 }
 
+bool is_file_hugetlbfs(const struct file *file);
+bool hugetlbfs_inode_is_internal(struct inode *inode);
+void hugetlb_vmtruncate(struct inode *inode, loff_t offset);
+
 static inline struct hstate *hstate_inode(struct inode *i)
 {
 	return HUGETLBFS_SB(i->i_sb)->hstate;

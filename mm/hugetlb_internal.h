@@ -115,6 +115,9 @@ extern long region_add(struct resv_map *resv, long f, long t, long in_regions_ne
 		       struct hstate *h, struct hugetlb_cgroup *h_cg);
 extern void region_abort(struct resv_map *resv, long f, long t, long regions_needed);
 
+long hugepage_subpool_get_pages(struct hugepage_subpool *spool, long delta);
+long hugepage_subpool_put_pages(struct hugepage_subpool *spool, long delta);
+
 static inline struct resv_map *inode_resv_map(struct inode *inode)
 {
 	return HUGETLBFS_I(inode)->resv_map;

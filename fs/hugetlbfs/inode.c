@@ -612,7 +612,7 @@ static void hugetlbfs_evict_inode(struct inode *inode)
 	clear_inode(inode);
 }
 
-static void hugetlb_vmtruncate(struct inode *inode, loff_t offset)
+void hugetlb_vmtruncate(struct inode *inode, loff_t offset)
 {
 	pgoff_t pgoff;
 	struct address_space *mapping = inode->i_mapping;
@@ -1493,6 +1493,24 @@ static struct file_system_type hugetlbfs_fs_type = {
 };
 
 static struct vfsmount *hugetlbfs_vfsmount[HUGE_MAX_HSTATE];
+
+/* Whether @file is a regular file on hugetlbfs. */
+bool is_file_hugetlbfs(const struct file *file)
+{
+	return file->f_op == &hugetlbfs_file_operations;
+}
+
+/*
+ * Whether @inode lives on one of the kernel-internal hugetlbfs mounts. These
+ * back memfd_create(MFD_HUGETLB) files and SysV SHM_HUGETLB segments, and are
+ * not visible to userspace.
+ */
+bool hugetlbfs_inode_is_internal(struct inode *inode)
+{
+	struct vfsmount *mnt = hugetlbfs_vfsmount[hstate_index(hstate_inode(inode))];
+
+	return mnt && inode->i_sb == mnt->mnt_sb;
+}
 
 static int can_do_hugetlb_shm(void)
 {
