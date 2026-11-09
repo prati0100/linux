@@ -4,7 +4,79 @@
  * Copyright (C) 2025 Pratyush Yadav <pratyush@kernel.org>
  */
 
-/* The documentation for this is in mm/memfd_luo.c */
+/**
+ * DOC: HugeTLB File Preservation via LUO
+ *
+ * Regular files on hugetlbfs can be preserved over a kexec with LUO. There are
+ * two kinds, which are preserved and retrieved differently:
+ *
+ * - memfds created with ``MFD_HUGETLB``. These live on internal hugetlbfs
+ *   mounts and are retrieved as a new memfd, like shmem-backed memfds.
+ * - Files on hugetlbfs mounts created by userspace, linked or not. These are
+ *   retrieved into an empty file userspace creates in the next kernel.
+ *
+ * Preserving
+ * ==========
+ *
+ * The caller needs write permission on the inode, but the fd does not need to
+ * be open for writing. A file that is already preserved, or that a retrieve
+ * has not finished with, can't be preserved.
+ *
+ * Once preserved, the file can't be truncated, grown, or have holes punched
+ * into it, by anyone, until it is unpreserved or the session is finished.
+ * Every hole up to the file size is filled when the file is preserved. For
+ * files on a user mount, that allocates pages and counts against the size limit
+ * of the mount, so preserving can fail with ``-ENOSPC``. Pages past the end of
+ * the file, as added by ``fallocate(FALLOC_FL_KEEP_SIZE)``, are not preserved.
+ *
+ * Preserved Properties
+ * ====================
+ *
+ * File contents and size
+ *   Preserved for both kinds of files.
+ *
+ * File position and seals
+ *   Preserved for memfds only. A file on a user mount always has exactly the
+ *   ``F_SEAL_SEAL`` seal; files with any other seals can't be preserved.
+ *
+ * Nothing else is preserved: no name, owner, mode, timestamps or extended
+ * attributes. For files on a user mount, all of those are up to userspace.
+ *
+ * Retrieving a File From a User Mount
+ * ===================================
+ *
+ * Userspace mounts hugetlbfs with the same page size, creates an empty file on
+ * it (for example with ``O_TMPFILE``), sets it up as it likes, and passes an
+ * fd to it, opened for writing, in &struct liveupdate_hugetlb_retrieve_arg.
+ * The preserved pages are added to that file and charged to the size limit of
+ * the mount. The file size is only set once all pages are in place. LUO returns
+ * a new fd to the same file.
+ *
+ * Mounts with a ``min_size`` can't be used. The target file must be empty:
+ * zero size, no pages past the end, and no pages reserved by a shared
+ * ``mmap()``. It can't be preserved itself, or be the target of another
+ * retrieve. Like a retrieved memfd, it can't be truncated, grown or have holes
+ * punched into it until the session is finished.
+ *
+ * memfds are retrieved without an argument, and only into a new memfd. A memfd
+ * can't be used as the target, and a file from a user mount can't be retrieved
+ * as a memfd.
+ *
+ * Retrieve errors caused by the argument or the target can be retried with a
+ * different argument; the preserved file stays intact. These are:
+ *
+ * - ``-EINVAL``: missing argument for a file from a user mount, or an argument
+ *   for a memfd; the target is not a hugetlbfs file on a user mount, has a
+ *   different page size, is on a mount with ``min_size``, or is not empty.
+ * - ``-EBADF``: the fd is not valid or not open for writing.
+ * - ``-EBUSY``: the target is preserved or being retrieved into.
+ * - ``-ENOSPC``: the mount of the target is too small for the file.
+ *
+ * A security module refusing writes to the target is retryable as well.
+ *
+ * Any other error means the preserved file is gone, and further attempts to
+ * retrieve it fail with the same error.
+ */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
@@ -19,6 +91,7 @@
 #include <linux/migrate.h>
 #include <linux/sched/mm.h>
 #include <linux/sched/signal.h>
+#include <linux/security.h>
 #include <linux/vmstat.h>
 #include <linux/kho/abi/hugetlb.h>
 #include <linux/kho_map.h>
@@ -190,12 +263,7 @@ unsigned long __init hstate_liveupdate_pages(struct hstate *h)
 static bool hugetlb_luo_can_preserve(struct liveupdate_file_handler *handler,
 				     struct file *file)
 {
-	/*
-	 * Only memfds for now. Files on mounts that userspace created can't be
-	 * restored correctly yet.
-	 */
-	return is_file_hugetlbfs(file) &&
-	       hugetlbfs_inode_is_internal(file_inode(file));
+	return is_file_hugetlbfs(file);
 }
 
 static void hugetlb_luo_unpreserve_folio(struct hstate *h, struct folio *folio)
@@ -402,18 +470,40 @@ static int hugetlb_luo_preserve_folios(struct file *file,
 	return err;
 }
 
-/* Read the seals of @file, making sure this version can preserve them. */
-static int hugetlb_luo_get_seals(struct file *file, u32 *sealsp)
+/* Check that this version can preserve, and restore, @seals. */
+static int hugetlb_luo_check_seals(u32 seals, u8 flags)
+{
+	if (seals & ~HUGETLB_LUO_ALL_SEALS)
+		return -EOPNOTSUPP;
+
+	/*
+	 * Retrieve can't change the seals of a hugetlbfs file, which are always
+	 * just F_SEAL_SEAL. Only memfd_create() can clear that.
+	 */
+	if ((flags & HUGETLB_LUO_FLAG_HUGETLBFS) && seals != F_SEAL_SEAL)
+		return -EOPNOTSUPP;
+
+	return 0;
+}
+
+/* Record the properties of @file that can change while it is preserved. */
+static int hugetlb_luo_update_ser(struct file *file,
+				  struct hugetlb_luo_ser *memfd_ser)
 {
 	int seals = memfd_get_seals(file);
+	int err;
 
 	if (seals < 0)
 		return seals;
 
-	if (seals & ~HUGETLB_LUO_ALL_SEALS)
-		return -EOPNOTSUPP;
+	err = hugetlb_luo_check_seals(seals, memfd_ser->flags);
+	if (err)
+		return err;
 
-	*sealsp = seals;
+	memfd_ser->seals = seals;
+	if (!(memfd_ser->flags & HUGETLB_LUO_FLAG_HUGETLBFS))
+		memfd_ser->pos = file->f_pos;
+
 	return 0;
 }
 
@@ -458,21 +548,29 @@ static int hugetlb_luo_preserve(struct liveupdate_file_op_args *args)
 	if (err)
 		goto err_free_folios;
 
+	if (!hugetlbfs_inode_is_internal(inode))
+		memfd_ser->flags = HUGETLB_LUO_FLAG_HUGETLBFS;
+
 	inode_lock(inode);
 
-	err = hugetlb_luo_get_seals(file, &memfd_ser->seals);
+	/* The file is already preserved, or the target of a retrieve. */
+	if (HUGETLBFS_I(inode)->frozen) {
+		err = -EBUSY;
+		goto err_unlock;
+	}
+
+	err = hugetlb_luo_update_ser(file, memfd_ser);
 	if (err)
 		goto err_unlock;
 
 	hugetlb_i_freeze(inode, true);
 
 	memfd_ser->size = i_size_read(inode);
-	memfd_ser->pos = file->f_pos;
 	memfd_ser->order = h->order;
 
 	err = hugetlb_luo_preserve_folios(file, folios);
 	if (err)
-		goto err_unlock;
+		goto err_unfreeze;
 
 	inode_unlock(inode);
 
@@ -480,8 +578,9 @@ static int hugetlb_luo_preserve(struct liveupdate_file_op_args *args)
 	args->private_data = folios;
 	return 0;
 
-err_unlock:
+err_unfreeze:
 	hugetlb_i_freeze(inode, false);
+err_unlock:
 	inode_unlock(inode);
 err_free_folios:
 	kfree(folios);
@@ -512,8 +611,7 @@ static int hugetlb_luo_freeze(struct liveupdate_file_op_args *args)
 	 * The pos and seals might have changed since preserve. Everything else
 	 * stays the same.
 	 */
-	memfd_ser->pos = args->file->f_pos;
-	return hugetlb_luo_get_seals(args->file, &memfd_ser->seals);
+	return hugetlb_luo_update_ser(args->file, memfd_ser);
 }
 
 /* Look up the hstate for @order, or return NULL if this kernel has none. */
@@ -706,9 +804,14 @@ static void hugetlb_luo_free_uncached_folio(struct hstate *h,
  *
  * The region is only added once the folio is in the page cache, so every
  * region has a folio behind it and releasing the file does not touch the
- * global reserve count (h->resv_huge_pages). The memfd comes from the internal
- * hugetlbfs mount, which has no subpool, so there is no subpool accounting
- * either.
+ * global reserve count (h->resv_huge_pages). The caller must already have
+ * charged the folio to the subpool of the file, if it has one. The folio
+ * gives the charge back when it is freed.
+ *
+ * Unlike other paths that add folios to the page cache, this doesn't take the
+ * hugetlb fault mutex: nothing can race to add a folio at the same index. A new
+ * memfd is not visible to anyone yet, and a target file has no size until all
+ * folios are added, so a fault on it bails out before allocating.
  *
  * On success, the folio is locked and the caller must unlock it. On error, the
  * folio is not in the page cache and NR_HUGETLB is not counted, so the caller
@@ -732,7 +835,7 @@ static int hugetlb_luo_add_folio_to_file(struct inode *inode,
 
 	/*
 	 * The index is already in the file. Can't happen since every index is
-	 * in the map only once and the file is new.
+	 * in the map only once and the file starts out empty.
 	 */
 	if (WARN_ON_ONCE(!chg)) {
 		err = -EINVAL;
@@ -765,6 +868,7 @@ static int hugetlb_luo_add_folio_to_file(struct inode *inode,
 		goto err_region_abort;
 
 	lruvec_stat_mod_folio(folio, NR_HUGETLB, nr_pages);
+	hugetlb_set_folio_subpool(folio, subpool_inode(inode));
 
 	/* Can't fail since region_chg() already allocated the entries. */
 	chg = region_add(resv_map, idx, idx + 1, regions_needed, NULL, NULL);
@@ -898,12 +1002,12 @@ static int hugetlb_luo_check_ser(struct hugetlb_luo_ser *memfd_ser)
 		return -ENODEV;
 	}
 
-	if (memfd_ser->flags) {
+	if (memfd_ser->flags & ~HUGETLB_LUO_ALL_FLAGS) {
 		pr_err("unsupported flags 0x%x\n", memfd_ser->flags);
 		return -EOPNOTSUPP;
 	}
 
-	if (memfd_ser->seals & ~HUGETLB_LUO_ALL_SEALS) {
+	if (hugetlb_luo_check_seals(memfd_ser->seals, memfd_ser->flags)) {
 		pr_err("unsupported seals 0x%x\n", memfd_ser->seals);
 		return -EOPNOTSUPP;
 	}
@@ -918,6 +1022,12 @@ static int hugetlb_luo_retrieve_memfd(struct liveupdate_file_op_args *args,
 	unsigned int flags;
 	struct file *file;
 	int err;
+
+	/* memfds are always retrieved into a new file. */
+	if (args->arg) {
+		args->retryable = true;
+		return -EINVAL;
+	}
 
 	/* Allow sealing so the preserved seals can be added. */
 	flags = MFD_HUGETLB | MFD_ALLOW_SEALING;
@@ -966,6 +1076,163 @@ err_discard:
 	return err;
 }
 
+static bool hugetlb_luo_resv_map_empty(struct resv_map *resv_map)
+{
+	guard(spinlock)(&resv_map->lock);
+	return list_empty(&resv_map->regions);
+}
+
+/*
+ * Check that @file can take the contents of a preserved file with hugepages of
+ * @order. These checks don't need the inode lock.
+ */
+static int hugetlb_luo_check_target(struct file *file, unsigned int order)
+{
+	struct inode *inode = file_inode(file);
+	struct hugepage_subpool *spool;
+
+	if (!(file->f_mode & FMODE_WRITE))
+		return -EBADF;
+
+	/* memfds can't be used as the target. */
+	if (!is_file_hugetlbfs(file) || hugetlbfs_inode_is_internal(inode))
+		return -EINVAL;
+
+	if (huge_page_order(hstate_inode(inode)) != order)
+		return -EINVAL;
+
+	/*
+	 * Pages charged to a mount with a minimum size can come out of the
+	 * reserves the mount holds in the global pool. The preserved pages are
+	 * not in the pool, so don't deal with that.
+	 */
+	spool = subpool_inode(inode);
+	if (spool && spool->min_hpages != -1)
+		return -EINVAL;
+
+	return security_file_permission(file, MAY_WRITE);
+}
+
+/*
+ * Check that the target @inode is free to be filled. Called with the inode lock
+ * held, so the result stays valid until it is dropped.
+ */
+static int hugetlb_luo_check_target_empty(struct inode *inode)
+{
+	/* The file is preserved, or the target of another retrieve. */
+	if (HUGETLBFS_I(inode)->frozen)
+		return -EBUSY;
+
+	/*
+	 * fallocate(FALLOC_FL_KEEP_SIZE) can add pages without growing the
+	 * file, and a shared mmap() can reserve them, even read-only.
+	 */
+	if (i_size_read(inode) || inode->i_mapping->nrpages ||
+	    !hugetlb_luo_resv_map_empty(inode_resv_map(inode)))
+		return -EINVAL;
+
+	return 0;
+}
+
+/*
+ * Put the contents of a file preserved from a hugetlbfs mount into the file
+ * userspace passed in the argument. Nothing else about that file is touched:
+ * its owner, mode, name and so on are up to userspace.
+ *
+ * TODO: The target is returned as the retrieved file, and LUO installs a new
+ * fd for it. So userspace ends up with two fds to the same file, and will
+ * probably want to close one of them.
+ */
+static int hugetlb_luo_retrieve_hugetlbfs(struct liveupdate_file_op_args *args,
+					  struct hugetlb_luo_ser *memfd_ser)
+{
+	const struct liveupdate_hugetlb_retrieve_arg *arg = args->arg;
+	struct hstate *h = hugetlb_luo_order_hstate(memfd_ser->order);
+	long nr_hpages = DIV_ROUND_UP_ULL(memfd_ser->size, huge_page_size(h));
+	struct hugepage_subpool *spool;
+	struct kho_map *folios;
+	struct inode *inode;
+	struct file *file;
+	long nr_added;
+	int err;
+
+	/* Until the preserved state is used, problems can be fixed and retried. */
+	args->retryable = true;
+
+	if (!arg)
+		return -EINVAL;
+
+	file = fget(arg->fd);
+	if (!file)
+		return -EBADF;
+
+	err = hugetlb_luo_check_target(file, memfd_ser->order);
+	if (err)
+		goto err_fput;
+
+	inode = file_inode(file);
+	inode_lock(inode);
+
+	err = hugetlb_luo_check_target_empty(inode);
+	if (err)
+		goto err_unlock;
+
+	/*
+	 * Charge the mount for the whole file up front, so a mount that is too
+	 * small is reported before the preserved state is used.
+	 *
+	 * Each folio added to the file takes over one page of this charge:
+	 * hugetlb_luo_add_folio_to_file() records the subpool in the folio, and
+	 * free_huge_folio() gives the page back when the folio is freed. Only
+	 * the part that no folio took over is given back below.
+	 */
+	spool = subpool_inode(inode);
+	if (hugepage_subpool_get_pages(spool, nr_hpages) < 0) {
+		err = -ENOSPC;
+		goto err_unlock;
+	}
+
+	args->retryable = false;
+
+	/*
+	 * Keep the file frozen until finish(). Other preserved objects might
+	 * depend on it.
+	 */
+	hugetlb_i_freeze(inode, true);
+
+	folios = hugetlb_luo_retrieve_folios(inode, memfd_ser);
+
+	/* The file was empty, so all folios in it were just added. */
+	nr_added = inode->i_mapping->nrpages / pages_per_huge_page(h);
+	hugepage_subpool_put_pages(spool, nr_hpages - nr_added);
+
+	if (IS_ERR(folios)) {
+		err = PTR_ERR(folios);
+		/*
+		 * Leave the file empty. This frees the folios that made it
+		 * into the page cache, and gives back their charge.
+		 */
+		hugetlb_vmtruncate(inode, 0);
+		hugetlb_i_freeze(inode, false);
+		goto err_unlock;
+	}
+
+	/* Set the size only now, so reads see an empty file until here. */
+	i_size_write(inode, memfd_ser->size);
+	inode_unlock(inode);
+
+	/* memfd_ser and the folios map are freed in finish(). */
+	args->file = file;
+	args->private_data = folios;
+	return 0;
+
+err_unlock:
+	inode_unlock(inode);
+err_fput:
+	fput(file);
+	return err;
+}
+
 static int hugetlb_luo_retrieve(struct liveupdate_file_op_args *args)
 {
 	struct hugetlb_luo_ser *memfd_ser;
@@ -981,6 +1248,9 @@ static int hugetlb_luo_retrieve(struct liveupdate_file_op_args *args)
 		hugetlb_luo_discard(memfd_ser);
 		return err;
 	}
+
+	if (memfd_ser->flags & HUGETLB_LUO_FLAG_HUGETLBFS)
+		return hugetlb_luo_retrieve_hugetlbfs(args, memfd_ser);
 
 	return hugetlb_luo_retrieve_memfd(args, memfd_ser);
 }
@@ -998,6 +1268,7 @@ static const struct liveupdate_file_ops hugetlb_luo_file_ops = {
 	.finish = hugetlb_luo_finish,
 	.retrieve = hugetlb_luo_retrieve,
 	.get_id = hugetlb_luo_get_id,
+	.rarg = LIVEUPDATE_ARG(struct liveupdate_hugetlb_retrieve_arg, fd),
 	.owner = THIS_MODULE,
 };
 

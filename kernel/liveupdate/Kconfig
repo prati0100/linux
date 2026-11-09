@@ -89,9 +89,9 @@ config LIVEUPDATE_HUGETLB
 	help
 
 	  Enable live update support for the HugeTLB subsystem. This allows live
-	  updating memfd backed by huge pages. This can be used by hypervisors that
-	  use hugetlb memfd to back VM memory, or for other user workloads needing
-	  to live update huge pages.
+	  updating memfds backed by huge pages and files on hugetlbfs. This can be
+	  used by hypervisors that use hugetlb memory to back VMs, or for other
+	  user workloads needing to live update huge pages.
 
 	  Enabling this config disables CMA for hugetlb pages. It is not yet
 	  supported with live update.

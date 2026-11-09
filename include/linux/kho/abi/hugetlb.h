@@ -8,6 +8,7 @@
 #ifndef _LINUX_KHO_ABI_HUGETLB_H
 #define _LINUX_KHO_ABI_HUGETLB_H
 
+#include <linux/bits.h>
 #include <linux/build_bug.h>
 #include <linux/fcntl.h>
 #include <linux/hugetlb.h>
@@ -102,6 +103,14 @@ static_assert(sizeof(union hugetlb_luo_folio_ser) == sizeof(u64));
 			       F_SEAL_FUTURE_WRITE | \
 			       F_SEAL_EXEC)
 
+/*
+ * The file was on a hugetlbfs mount created by userspace, not on one of the
+ * internal mounts that back memfds.
+ */
+#define HUGETLB_LUO_FLAG_HUGETLBFS	BIT(0)
+
+#define HUGETLB_LUO_ALL_FLAGS		HUGETLB_LUO_FLAG_HUGETLBFS
+
 /**
  * struct hugetlb_luo_ser - Main serialization structure of a hugetlb file.
  * @size:         The total size of the file in bytes (i_size).
@@ -111,9 +120,12 @@ static_assert(sizeof(union hugetlb_luo_folio_ser) == sizeof(u64));
  *                safe to directly use them in the ABI. Only seals in
  *                %HUGETLB_LUO_ALL_SEALS may be set.
  * @order:        Order of the hugepages that back this file.
- * @flags:        Flags describing the file. None are defined yet, so this must
- *                be 0.
+ * @flags:        Flags describing the file. Only flags in
+ *                %HUGETLB_LUO_ALL_FLAGS may be set.
  * @reserved:     Explicit padding. Must be set to 0.
+ *
+ * @pos is only used for memfds. For files with %HUGETLB_LUO_FLAG_HUGETLBFS it
+ * is 0, and @seals is always exactly ``F_SEAL_SEAL``.
  */
 struct hugetlb_luo_ser {
 	u64 size;

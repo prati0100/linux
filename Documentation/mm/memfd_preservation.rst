@@ -16,6 +16,12 @@ Memfd Preservation ABI
 .. kernel-doc:: include/linux/kho/abi/memfd.h
    :internal:
 
+HugeTLB File Preservation
+=========================
+
+.. kernel-doc:: mm/hugetlb_luo.c
+   :doc: HugeTLB File Preservation via LUO
+
 HugeTLB File Preservation ABI
 =============================
 

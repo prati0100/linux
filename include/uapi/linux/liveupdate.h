@@ -196,6 +196,23 @@ struct liveupdate_session_retrieve_fd {
 	_IO(LIVEUPDATE_IOCTL_TYPE, LIVEUPDATE_CMD_SESSION_RETRIEVE_FD)
 
 /**
+ * struct liveupdate_hugetlb_retrieve_arg - Retrieve argument for hugetlbfs files
+ * @size: Input; sizeof(struct liveupdate_hugetlb_retrieve_arg)
+ * @fd:   Input; The hugetlbfs file to put the preserved contents into.
+ *
+ * Passed in &liveupdate_session_retrieve_fd.arg to retrieve a file that was
+ * preserved from a hugetlbfs mount. The file in @fd must be an empty regular
+ * file on a hugetlbfs mount with the same page size, opened for writing. On
+ * success, the preserved contents are added to it and its size is set. All
+ * other properties of the file are left as they are. memfds created with
+ * ``MFD_HUGETLB`` are retrieved without an argument.
+ */
+struct liveupdate_hugetlb_retrieve_arg {
+	__u32	size;
+	__s32	fd;
+};
+
+/**
  * struct liveupdate_session_finish - ioctl(LIVEUPDATE_SESSION_FINISH)
  * @size:     Input; sizeof(struct liveupdate_session_finish)
  * @reserved: Input; Must be zero. Reserved for future use.
