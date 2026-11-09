@@ -691,9 +691,14 @@ int luo_retrieve_file(struct luo_file_set *file_set, u64 token, u64 arg,
 	/* Get reference so we can keep this file in LUO until finish */
 	get_file(luo_file->file);
 
-	WARN_ON(xa_insert(&luo_preserved_files,
-			  luo_get_id(luo_file->fh, luo_file->file),
-			  luo_file->file, GFP_KERNEL));
+	/*
+	 * If the handler retrieved into a file supplied by userspace, someone
+	 * might be preserving that file right now and hold the entry. The
+	 * handler makes that preserve fail, so the error can be ignored.
+	 */
+	err = xa_insert(&luo_preserved_files,
+			luo_get_id(luo_file->fh, luo_file->file),
+			luo_file->file, GFP_KERNEL);
 
 	*filep = luo_file->file;
 	luo_file->retrieve_status = 1;
