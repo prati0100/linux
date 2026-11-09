@@ -16,20 +16,20 @@
 #include <linux/kho/abi/map.h>
 
 /**
- * DOC: hugetlb-backed memfd live update ABI
+ * DOC: hugetlb file live update ABI
  *
  * This header defines the ABI for preserving the state of the hugetlb subsystem
- * and a hugetlb-backed memfd across a kexec reboot using LUO.
+ * and of hugetlb files across a kexec reboot using LUO.
  *
- * The folios of a hugetlb-backed memfd are stored in a KHO map, keyed by the
+ * The folios of a hugetlb file are stored in a KHO map, keyed by the
  * index of the hugepage in the file (the file offset divided by the hugepage
  * size). The value is a ``union hugetlb_luo_folio_ser``. A value of 0 means
  * there is no folio at that index.
  *
  * This interface is a contract. Any modification to the structure layout
  * constitutes a breaking change. Such changes require incrementing the version
- * number in the HUGETLB_FLB_COMPATIBLE or HUGE_MEMFD_COMPATIBLE strings for
- * hugetlb FLB or hugetlb-backed memfd, respectively.
+ * number in the HUGETLB_FLB_COMPATIBLE or HUGETLB_FILE_COMPATIBLE strings for
+ * hugetlb FLB or hugetlb files, respectively.
  */
 
 /*
@@ -103,7 +103,7 @@ static_assert(sizeof(union hugetlb_luo_folio_ser) == sizeof(u64));
 			       F_SEAL_EXEC)
 
 /**
- * struct hugetlb_luo_ser - Main serialization structure of a HugeTLB-backed memfd.
+ * struct hugetlb_luo_ser - Main serialization structure of a hugetlb file.
  * @size:         The total size of the file in bytes (i_size).
  * @pos:          The file's current position (f_pos).
  * @folios:       Folios in the file.
@@ -111,6 +111,8 @@ static_assert(sizeof(union hugetlb_luo_folio_ser) == sizeof(u64));
  *                safe to directly use them in the ABI. Only seals in
  *                %HUGETLB_LUO_ALL_SEALS may be set.
  * @order:        Order of the hugepages that back this file.
+ * @flags:        Flags describing the file. None are defined yet, so this must
+ *                be 0.
  * @reserved:     Explicit padding. Must be set to 0.
  */
 struct hugetlb_luo_ser {
@@ -119,11 +121,12 @@ struct hugetlb_luo_ser {
 	struct kho_map_ser folios;
 	u32 seals;
 	u8 order;
-	u8 reserved[3];
+	u8 flags;
+	u8 reserved[2];
 };
 
 static_assert(sizeof(struct hugetlb_luo_ser) <= PAGE_SIZE);
 
-#define HUGE_MEMFD_COMPATIBLE "huge-memfd-v1"
+#define HUGETLB_FILE_COMPATIBLE "hugetlb-file-v1"
 
 #endif /* _LINUX_KHO_ABI_HUGETLB_H */

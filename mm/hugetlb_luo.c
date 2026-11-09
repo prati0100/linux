@@ -190,9 +190,12 @@ unsigned long __init hstate_liveupdate_pages(struct hstate *h)
 static bool hugetlb_luo_can_preserve(struct liveupdate_file_handler *handler,
 				     struct file *file)
 {
-	struct inode *inode = file_inode(file);
-
-	return is_file_hugetlbfs(file) && !inode->i_nlink;
+	/*
+	 * Only memfds for now. Files on mounts that userspace created can't be
+	 * restored correctly yet.
+	 */
+	return is_file_hugetlbfs(file) &&
+	       hugetlbfs_inode_is_internal(file_inode(file));
 }
 
 static void hugetlb_luo_unpreserve_folio(struct hstate *h, struct folio *folio)
@@ -887,6 +890,12 @@ static int hugetlb_luo_retrieve(struct liveupdate_file_op_args *args)
 		goto err_discard_folios;
 	}
 
+	if (memfd_ser->flags) {
+		pr_err("unsupported flags 0x%x\n", memfd_ser->flags);
+		err = -EOPNOTSUPP;
+		goto err_discard_folios;
+	}
+
 	if (memfd_ser->seals & ~HUGETLB_LUO_ALL_SEALS) {
 		pr_err("unsupported seals 0x%x\n", memfd_ser->seals);
 		err = -EOPNOTSUPP;
@@ -964,7 +973,7 @@ static const struct liveupdate_file_ops hugetlb_luo_file_ops = {
 
 static struct liveupdate_file_handler hugetlb_luo_handler = {
 	.ops = &hugetlb_luo_file_ops,
-	.compatible = HUGE_MEMFD_COMPATIBLE,
+	.compatible = HUGETLB_FILE_COMPATIBLE,
 };
 
 void __init hugetlb_luo_init(void)
