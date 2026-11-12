@@ -33,6 +33,7 @@
 #include <linux/vmstat.h>
 #include <linux/kexec_handover.h>
 #include <linux/hugetlb.h>
+#include <linux/sched/clock.h>
 #include "internal.h"
 #include "mm_init.h"
 #include "page_alloc.h"
@@ -813,6 +814,99 @@ static inline void __init_deferred_page(unsigned long pfn, int nid)
 void __meminit init_deferred_page(unsigned long pfn, int nid)
 {
 	__init_deferred_page(pfn, nid);
+}
+
+#ifdef CONFIG_DEFERRED_STRUCT_PAGE_INIT
+/*
+ * Same result as pfn_to_zone(), and also return in @valid_end the first pfn
+ * above @pfn for which the result may differ.
+ */
+static struct zone *__init pfn_to_zone_cached(unsigned long pfn, int nid,
+					      unsigned long *valid_end)
+{
+	pg_data_t *pgdat = NODE_DATA(nid);
+	unsigned long end = ULONG_MAX;
+
+	for (enum zone_type zone_type = 0; zone_type < MAX_NR_ZONES; zone_type++) {
+		struct zone *zone = &pgdat->node_zones[zone_type];
+
+		if (zone_spans_pfn(zone, pfn)) {
+			*valid_end = min(end, zone_end_pfn(zone));
+			return zone;
+		}
+		/* a lower zone that starts above pfn takes precedence there */
+		if (zone->spanned_pages && zone->zone_start_pfn > pfn)
+			end = min(end, zone->zone_start_pfn);
+	}
+
+	*valid_end = end;
+	return NULL;
+}
+#endif
+
+/**
+ * init_deferred_page_range - initialize the struct pages of a pfn range
+ * @pfn: first pfn of the range
+ * @end_pfn: end of the range (exclusive)
+ *
+ * Equivalent to calling init_deferred_page() for every pfn of the range with
+ * the node id of @pfn as given by early_pfn_to_nid(), but the node id, the
+ * node's first deferred pfn and the zone are looked up once per range (and
+ * cached across calls) instead of once per page.
+ *
+ * Return: number of struct pages initialized.
+ */
+unsigned long __init init_deferred_page_range(unsigned long pfn,
+					      unsigned long end_pfn)
+{
+#ifdef CONFIG_DEFERRED_STRUCT_PAGE_INIT
+	static unsigned long nid_start __initdata, nid_end __initdata;
+	static int nid_cached __initdata;
+	unsigned long zone_end = 0, n = 0;
+	struct zone *zone = NULL;
+	int nid;
+
+	if (pfn >= nid_start && pfn < nid_end) {
+		nid = nid_cached;
+	} else {
+#ifdef CONFIG_NUMA
+		unsigned long start, end;
+
+		/* same lookup and fallback as early_pfn_to_nid() */
+		nid = memblock_search_pfn_nid(pfn, &start, &end);
+		if (nid != NUMA_NO_NODE) {
+			nid_start = start;
+			nid_end = end;
+			nid_cached = nid;
+		} else {
+			nid = first_online_node;
+		}
+#else
+		nid = early_pfn_to_nid(pfn);
+#endif
+	}
+
+	/* early_page_initialised() is true for every pfn of the range */
+	if (!node_online(nid))
+		return 0;
+	pfn = max(pfn, NODE_DATA(nid)->first_deferred_pfn);
+
+	for (; pfn < end_pfn; pfn++) {
+		if (pfn >= zone_end)
+			zone = pfn_to_zone_cached(pfn, nid, &zone_end);
+		__init_single_page(pfn_to_page(pfn), pfn,
+				   zone ? zone_idx(zone) : MAX_NR_ZONES, nid);
+		if (pageblock_aligned(pfn)) {
+			enum migratetype mt =
+				kho_bootmem_migratetype(pfn, MIGRATE_MOVABLE);
+			init_pageblock_migratetype(pfn_to_page(pfn), mt, false);
+		}
+		n++;
+	}
+	return n;
+#else
+	return 0;
+#endif
 }
 
 /*
@@ -2699,6 +2793,8 @@ void __init mm_core_init_early(void)
  */
 void __init mm_core_init(void)
 {
+	u64 t0;
+
 	arch_mm_preinit();
 	init_zero_page_pfn();
 
@@ -2724,7 +2820,12 @@ void __init mm_core_init(void)
 	 */
 	kho_memory_init();
 
+	t0 = local_clock();
 	memblock_free_all();
+	if (is_kho_boot())
+		pr_info("KHO_BENCH: memblock_free_all t=%lluns reserved_pages_t=%lluns free_ranges_t=%lluns\n",
+			local_clock() - t0, memblock_bench_reserved_pages_ns,
+			memblock_bench_free_ranges_ns);
 	mem_init();
 	kmem_cache_init();
 	/*

@@ -26,6 +26,7 @@
 #include <linux/list.h>
 #include <linux/memblock.h>
 #include <linux/page-isolation.h>
+#include <linux/sched/clock.h>
 #include <linux/sort.h>
 #include <linux/unaligned.h>
 #include <linux/vmalloc.h>
@@ -81,6 +82,120 @@ static int __init kho_parse_enable(char *p)
 	return kstrtobool(p, &kho_enable);
 }
 early_param("kho", kho_parse_enable);
+
+/*
+ * Benchmark knob: selects how memory preserved by the previous kernel is
+ * reserved in memblock on a KHO boot.
+ *
+ * baseline: upstream flow. memblock allocations are restricted to
+ *           MEMBLOCK_KHO_NOPRSRV memory until kho_memory_init() walks the
+ *           radix tree and reserves all preserved ranges.
+ * early:    the radix tree is walked right after the architecture has set
+ *           up the direct map and allowed memblock resizing. Every preserved
+ *           range and every radix tree node page is reserved while the
+ *           noprsrv-only restriction is still active, then the restriction
+ *           is lifted. A second walk in kho_memory_init() (after memmap_init)
+ *           only initializes the struct pages of the preserved memory.
+ *
+ * The early_* variants are the early flow plus small improvements, each one
+ * selected by a KHO_OPT_* bit:
+ *
+ * NOINIT1:   reserve every range with a single __memblock_reserve() call
+ *            with MEMBLOCK_RSRV_NOINIT instead of memblock_reserve() followed
+ *            by memblock_reserved_mark_noinit().
+ * COALESCE:  walk whole leaf bitmaps and reserve runs of physically
+ *            contiguous preserved blocks with one call per run.
+ * PRESIZE:   count the ranges first and grow memblock.reserved once, so it
+ *            is never doubled during the walk.
+ * BULK:      count, collect all ranges (NOINIT) and radix tree node pages
+ *            into a temporary array, sort it and merge it into
+ *            memblock.reserved in one linear pass (memblock_reserve_bulk()).
+ * NODEFREE:  keep the radix tree node pages reserved after the second walk
+ *            and give them to the buddy allocator in an initcall, instead of
+ *            freeing them one by one in memblock.
+ * BATCHINIT: second walk initializes the struct pages of each preserved
+ *            block with init_deferred_page_range().
+ *
+ * kho_reserve_opts= overrides the bits of the selected mode (debugging).
+ */
+#define KHO_OPT_NOINIT1		BIT(0)
+#define KHO_OPT_COALESCE	BIT(1)
+#define KHO_OPT_PRESIZE		BIT(2)
+#define KHO_OPT_BULK		BIT(3)
+#define KHO_OPT_NODEFREE	BIT(4)
+#define KHO_OPT_BATCHINIT	BIT(5)
+#define KHO_OPT_ALL		GENMASK(5, 0)
+/* Bits that change the first walk. Cleared when falling back to it. */
+#define KHO_OPT_WALK1		(KHO_OPT_NOINIT1 | KHO_OPT_COALESCE | \
+				 KHO_OPT_PRESIZE | KHO_OPT_BULK)
+/* Debug only: pretend the temporary allocations of the first walk fail. */
+#define KHO_OPT_DBG_NOMEM	BIT(8)
+
+struct kho_reserve_mode_desc {
+	const char *name;
+	bool early;
+	unsigned int opts;
+};
+
+static const struct kho_reserve_mode_desc kho_reserve_modes[] __initconst = {
+	{ "baseline",		false,	0 },
+	{ "early",		true,	0 },
+	{ "early_noinit1",	true,	KHO_OPT_NOINIT1 },
+	{ "early_coalesce",	true,	KHO_OPT_COALESCE },
+	{ "early_presize",	true,	KHO_OPT_PRESIZE },
+	{ "early_bulk",		true,	KHO_OPT_BULK },
+	{ "early_nodefree",	true,	KHO_OPT_NODEFREE },
+	{ "early_batchinit",	true,	KHO_OPT_BATCHINIT },
+	{ "early_opt",		true,	KHO_OPT_ALL },
+};
+
+/* Index into kho_reserve_modes[], 0 is baseline */
+static unsigned int kho_reserve_mode __initdata;
+/* kho_reserve_opts=, -1 if not given */
+static long kho_reserve_opts_cmdline __initdata = -1;
+/* Resolved KHO_OPT_* bits of the active mode */
+static unsigned int kho_opts __initdata;
+/* kho_reserve_check=1: verify memblock.reserved after the first walk */
+static bool kho_reserve_check __initdata;
+/* Set when the early walk reserved all preserved memory successfully. */
+static bool kho_early_reserved __initdata;
+
+#define kho_reserve_mode_name	kho_reserve_modes[kho_reserve_mode].name
+
+static int __init kho_parse_reserve_mode(char *p)
+{
+	if (!p)
+		return -EINVAL;
+
+	for (int i = 0; i < ARRAY_SIZE(kho_reserve_modes); i++) {
+		if (!strcmp(p, kho_reserve_modes[i].name)) {
+			kho_reserve_mode = i;
+			return 0;
+		}
+	}
+
+	pr_warn("unknown kho_reserve_mode=%s, keeping %s\n", p,
+		kho_reserve_mode_name);
+	return 0;
+}
+early_param("kho_reserve_mode", kho_parse_reserve_mode);
+
+static int __init kho_parse_reserve_opts(char *p)
+{
+	unsigned int opts;
+
+	if (!p || kstrtouint(p, 0, &opts))
+		return -EINVAL;
+	kho_reserve_opts_cmdline = opts;
+	return 0;
+}
+early_param("kho_reserve_opts", kho_parse_reserve_opts);
+
+static int __init kho_parse_reserve_check(char *p)
+{
+	return kstrtobool(p, &kho_reserve_check);
+}
+early_param("kho_reserve_check", kho_parse_reserve_check);
 
 struct kho_out {
 	void *fdt;
@@ -402,6 +517,10 @@ static int kho_radix_walk_leaf(struct kho_radix_leaf *leaf, unsigned long key,
 		if (err)
 			return err;
 	}
+
+	if (cb->leaf_bitmap)
+		return cb->leaf_bitmap(key, bitmap, PAGE_SIZE * BITS_PER_BYTE,
+				       data);
 
 	if (!cb->leaf)
 		return 0;
@@ -1725,10 +1844,15 @@ static void __init kho_mem_retrieve(void)
 	const struct kho_radix_walk_cb cb = {
 		.leaf = kho_preserved_memory_reserve,
 	};
+	unsigned long cnt0 = memblock.reserved.cnt;
+	u64 t0 = local_clock();
 
 	if (kho_radix_walk_tree(&kho_in.radix_tree, &cb, NULL))
 		goto err;
 
+	pr_info("KHO_BENCH: mode=%s retrieve reserved.cnt=%lu->%lu max=%lu t=%lluns\n",
+		kho_reserve_mode_name, cnt0, memblock.reserved.cnt,
+		memblock.reserved.max, local_clock() - t0);
 	return;
 
 err:
@@ -1738,6 +1862,164 @@ err:
 	 */
 	kho_in.fdt_phys = 0;
 	kho_in.radix_tree.root = NULL;
+}
+
+/*
+ * Second walk of the early reserve mode: the preserved ranges are already
+ * reserved (and marked noinit) in memblock, only the struct pages need to be
+ * initialized. Same as kho_preserved_memory_reserve() minus the memblock
+ * calls.
+ */
+struct kho_walk2_stats {
+	unsigned long keys;
+	unsigned long pages;
+	unsigned long pages_inited;
+};
+
+static int __init kho_preserved_page_init(unsigned long key, void *data)
+{
+	struct kho_walk2_stats *st = data;
+	union kho_page_info info;
+	struct page *page;
+	unsigned int order;
+	phys_addr_t phys;
+
+	phys = kho_decode_radix_key(key, &order);
+	page = kho_get_preserved_page(phys, order);
+
+	info.magic = KHO_PAGE_MAGIC;
+	info.order = order;
+	page->private = info.page_private;
+	st->keys++;
+	st->pages += 1UL << order;
+
+	return 0;
+}
+
+/*
+ * KHO_OPT_BATCHINIT: same as kho_preserved_page_init(), but the struct pages
+ * of the block are initialized by init_deferred_page_range(), which does the
+ * node, zone and first deferred pfn lookups once instead of once per page.
+ */
+static int __init kho_preserved_page_init_batched(unsigned long key,
+						  void *data)
+{
+	struct kho_walk2_stats *st = data;
+	union kho_page_info info;
+	unsigned long pfn;
+	unsigned int order;
+
+	pfn = PHYS_PFN(kho_decode_radix_key(key, &order));
+	st->pages_inited += init_deferred_page_range(pfn, pfn + (1UL << order));
+
+	/* private must be written after the head page was initialized */
+	info.magic = KHO_PAGE_MAGIC;
+	info.order = order;
+	pfn_to_page(pfn)->private = info.page_private;
+	st->keys++;
+	st->pages += 1UL << order;
+
+	return 0;
+}
+
+/* KHO_OPT_NODEFREE: root of the radix tree whose node pages are still reserved */
+static struct kho_radix_node *kho_early_nodes_root __initdata;
+
+static void __init kho_free_reserved_tree(struct kho_radix_node *node,
+					  unsigned int level,
+					  unsigned long *nr)
+{
+	if (level) {
+		for (unsigned long i = 0; i < PAGE_SIZE / sizeof(phys_addr_t); i++) {
+			if (node->table[i])
+				kho_free_reserved_tree(phys_to_virt(node->table[i]),
+						       level - 1, nr);
+		}
+	}
+
+	/* children are freed before their parent, so node is not read again */
+	free_reserved_page(virt_to_page(node));
+	(*nr)++;
+}
+
+/*
+ * KHO_OPT_NODEFREE: the radix tree node pages stayed reserved in memblock, so
+ * memblock_free_all() initialized their struct pages and marked them
+ * PageReserved. Give them to the buddy allocator now. This must run after
+ * page_alloc_init_late() (deferred struct page init done), so it is not an
+ * early_initcall, and it cannot hang off kho_init(), which bails out when
+ * kho is not enabled in this kernel.
+ */
+static int __init kho_free_early_nodes(void)
+{
+	unsigned long nr = 0;
+	u64 t0;
+
+	if (!kho_early_nodes_root)
+		return 0;
+
+	/*
+	 * Not local_clock(): until sched_clock is marked stable (late
+	 * initcall) it is clamped to the jiffies based time of day and short
+	 * intervals read as 0.
+	 */
+	t0 = sched_clock();
+	kho_free_reserved_tree(kho_early_nodes_root, KHO_TREE_MAX_DEPTH - 1,
+			       &nr);
+	kho_early_nodes_root = NULL;
+	pr_info("KHO_BENCH: mode=%s nodes_late_free n=%lu t=%lluns\n",
+		kho_reserve_mode_name, nr, sched_clock() - t0);
+	return 0;
+}
+core_initcall(kho_free_early_nodes);
+
+static void __init kho_mem_init_pages(void)
+{
+	const struct kho_radix_walk_cb cb = {
+		.leaf = (kho_opts & KHO_OPT_BATCHINIT) ?
+			kho_preserved_page_init_batched :
+			kho_preserved_page_init,
+	};
+	struct kho_walk2_stats st = { };
+	u64 t0, t1, t2;
+
+	t0 = local_clock();
+	if (kho_radix_walk_tree(&kho_in.radix_tree, &cb, &st)) {
+		pr_err("KHO_BENCH: mode=%s walk2 failed after %lu keys\n",
+		       kho_reserve_mode_name, st.keys);
+		kho_in.fdt_phys = 0;
+		kho_in.radix_tree.root = NULL;
+		return;
+	}
+	t1 = local_clock();
+
+	if (kho_opts & KHO_OPT_NODEFREE) {
+		/*
+		 * Keep the node pages reserved: freeing each of them in
+		 * memblock moves the tail of the (large) reserved array.
+		 * kho_free_early_nodes() releases them later.
+		 */
+		kho_early_nodes_root = kho_in.radix_tree.root;
+		kho_in.radix_tree.root = NULL;
+	} else {
+		/*
+		 * The radix tree node pages were reserved by the early walk so
+		 * nothing could allocate over them before this walk. They are
+		 * not needed anymore; release them to memblock so they reach
+		 * the buddy allocator in memblock_free_all(), like in the
+		 * baseline flow. The destroy walk frees children before their
+		 * parent, so no node is read after it was freed.
+		 */
+		kho_radix_destroy_tree(&kho_in.radix_tree);
+	}
+	t2 = local_clock();
+
+	pr_info("KHO_BENCH: mode=%s walk2 keys=%lu reserved.cnt=%lu max=%lu t=%lluns free_nodes_t=%lluns pages=%lu\n",
+		kho_reserve_mode_name, st.keys, memblock.reserved.cnt,
+		memblock.reserved.max, t1 - t0, t2 - t1, st.pages);
+	if (kho_opts & KHO_OPT_BATCHINIT)
+		pr_info("KHO_BENCH: mode=%s walk2 pages_inited=%lu\n",
+			kho_reserve_mode_name, st.pages_inited);
 }
 
 static __init int kho_out_fdt_setup(void)
@@ -1936,12 +2218,606 @@ err_free_bootmem:
 }
 fs_initcall(kho_init);
 
+/* Sorted streams merged one by one by KHO_OPT_BULK; more are sorted */
+#define KHO_EARLY_MAX_STREAMS	64
+
+/*
+ * State of the first walk of the early reserve modes.
+ *
+ * Ranges reach kho_early_reserve_range() either once per key (default), or
+ * once per run of physically contiguous blocks (KHO_OPT_COALESCE and
+ * KHO_OPT_BULK, which walk whole leaf bitmaps and keep the current run in
+ * run_start/run_end so that it also extends across leaves).
+ */
+struct kho_early_ctx {
+	unsigned long keys;	/* preserved blocks */
+	unsigned long nodes;	/* radix tree node pages */
+	unsigned long ranges;	/* reserve calls or collected ranges */
+	u64 bytes;
+	u64 node_ns;		/* time spent in the node callback */
+
+	bool count_only;	/* only count keys, ranges and nodes */
+
+	/* pending run, coalesced walks only */
+	phys_addr_t run_start, run_end;
+
+	/*
+	 * KHO_OPT_BULK: collected ranges and node pages. The walk visits keys
+	 * order by order, each order in ascending address order, so the
+	 * ranges form a few sorted streams; stream[] records where each one
+	 * starts. Node pages go to their own array.
+	 */
+	struct memblock_region *rgn, *node_rgn;
+	unsigned long nr, cap, nr_nodes, cap_nodes;
+	phys_addr_t last_end;
+	unsigned long stream[KHO_EARLY_MAX_STREAMS];
+	unsigned int nr_streams;
+	bool unsorted;		/* too many streams: sort everything */
+};
+
+/* Timers of the optional steps of the first walk, printed with walk1 */
+struct kho_early_times {
+	u64 count, presize, alloc, collect, sort, bulk;
+	unsigned int streams;	/* streams merged one by one, 0: sorted */
+	const char *fallback;
+};
+
+static struct kho_early_ctx kho_early_ctx __initdata;
+
+static void __init kho_early_set_region(struct memblock_region *r,
+					phys_addr_t base, phys_addr_t size,
+					enum memblock_flags flags)
+{
+	r->base = base;
+	r->size = size;
+	r->flags = flags;
+	memblock_set_region_node(r, NUMA_NO_NODE);
+}
+
+/* Append a preserved range (NOINIT), tracking the sorted streams */
+static int __init kho_early_append(struct kho_early_ctx *c, phys_addr_t base,
+				   phys_addr_t size)
+{
+	if (c->nr >= c->cap)
+		return -EOVERFLOW;
+
+	if (!c->nr || base < c->last_end) {
+		if (c->nr_streams < KHO_EARLY_MAX_STREAMS)
+			c->stream[c->nr_streams++] = c->nr;
+		else
+			c->unsorted = true;
+	}
+	c->last_end = base + size;
+	kho_early_set_region(&c->rgn[c->nr++], base, size,
+			     MEMBLOCK_RSRV_NOINIT);
+	return 0;
+}
+
+/* Append a radix tree node page (no flags) */
+static int __init kho_early_append_node(struct kho_early_ctx *c,
+					phys_addr_t phys)
+{
+	if (c->nr_nodes >= c->cap_nodes)
+		return -EOVERFLOW;
+
+	kho_early_set_region(&c->node_rgn[c->nr_nodes++], phys, PAGE_SIZE,
+			     MEMBLOCK_NONE);
+	return 0;
+}
+
+/* Reserve one preserved range [base, base + size) */
+static int __init kho_early_reserve_range(struct kho_early_ctx *c,
+					  phys_addr_t base, phys_addr_t size)
+{
+	int err;
+
+	c->ranges++;
+	if (c->count_only)
+		return 0;
+	if (c->rgn)
+		return kho_early_append(c, base, size);
+
+	/*
+	 * NOINIT is required: kho_mem_init_pages() initializes the struct
+	 * pages and stores the KHO metadata in them before
+	 * memblock_free_all(), which must not initialize them again.
+	 */
+	if (kho_opts & KHO_OPT_NOINIT1)
+		return __memblock_reserve(base, size, NUMA_NO_NODE,
+					  MEMBLOCK_RSRV_NOINIT);
+
+	/* Same memblock operations as kho_preserved_memory_reserve() */
+	err = memblock_reserve(base, size);
+	if (!err)
+		err = memblock_reserved_mark_noinit(base, size);
+	return err;
+}
+
+static int __init kho_early_reserve_leaf(unsigned long key, void *data)
+{
+	struct kho_early_ctx *c = data;
+	unsigned int order;
+	phys_addr_t phys;
+	u64 sz;
+
+	phys = kho_decode_radix_key(key, &order);
+	sz = 1ULL << (order + PAGE_SHIFT);
+
+	c->keys++;
+	c->bytes += sz;
+	return kho_early_reserve_range(c, phys, sz);
+}
+
+static int __init kho_early_flush_run(struct kho_early_ctx *c)
+{
+	phys_addr_t base = c->run_start, size = c->run_end - c->run_start;
+
+	c->run_start = 0;
+	c->run_end = 0;
+	return size ? kho_early_reserve_range(c, base, size) : 0;
+}
+
+/* Add [base, base + size) to the pending run, flushing it if not adjacent */
+static int __init kho_early_add_run(struct kho_early_ctx *c, phys_addr_t base,
+				    phys_addr_t size)
+{
+	int err;
+
+	if (c->run_end != c->run_start && base == c->run_end) {
+		c->run_end += size;
+		return 0;
+	}
+
+	err = kho_early_flush_run(c);
+	if (err)
+		return err;
+	c->run_start = base;
+	c->run_end = base + size;
+	return 0;
+}
+
+/*
+ * Coalescing leaf callback. All keys of a leaf have the same order (the order
+ * bit is above the bits indexing the bitmap), and the physical address of
+ * key_base | i grows linearly with i, so a run of set bits [i, j) is the
+ * physically contiguous range [decode(key_base | i), + (j - i) blocks).
+ */
+static int __init kho_early_reserve_bitmap(unsigned long key_base,
+					   const unsigned long *bitmap,
+					   unsigned int nbits, void *data)
+{
+	struct kho_early_ctx *c = data;
+	unsigned long i, j;
+	unsigned int order;
+	phys_addr_t base, size;
+	int err;
+
+	/* the order bit must not be one of the bitmap index bits */
+	if (WARN_ON_ONCE(fls64(key_base) <= ilog2(nbits)))
+		return -EINVAL;
+
+	for (i = find_first_bit(bitmap, nbits); i < nbits;
+	     i = find_next_bit(bitmap, nbits, j)) {
+		j = find_next_zero_bit(bitmap, nbits, i + 1);
+		base = kho_decode_radix_key(key_base | i, &order);
+		size = (phys_addr_t)(j - i) << (order + PAGE_SHIFT);
+
+		c->keys += j - i;
+		c->bytes += size;
+		err = kho_early_add_run(c, base, size);
+		if (err)
+			return err;
+	}
+
+	return 0;
+}
+
+static int __init kho_early_reserve_node(phys_addr_t phys, void *data)
+{
+	struct kho_early_ctx *c = data;
+	u64 t0 = local_clock();
+	int err = 0;
+
+	c->nodes++;
+	if (c->count_only)
+		return 0;
+
+	/*
+	 * Keep the tree intact until the second walk in kho_memory_init().
+	 * Node pages are not NOINIT: they are initialized and freed like
+	 * normal memory.
+	 */
+	if (c->rgn)
+		err = kho_early_append_node(c, phys);
+	else
+		err = memblock_reserve(phys, PAGE_SIZE);
+
+	c->node_ns += local_clock() - t0;
+	return err;
+}
+
+/* One walk of the whole tree; coalesced walks flush their last run. */
+static int __init kho_early_walk(struct kho_early_ctx *c, bool coalesce)
+{
+	const struct kho_radix_walk_cb cb = {
+		.leaf = coalesce ? NULL : kho_early_reserve_leaf,
+		.leaf_bitmap = coalesce ? kho_early_reserve_bitmap : NULL,
+		.node = kho_early_reserve_node,
+	};
+	int err;
+
+	/* Single threaded early boot: no need for the tree lock. */
+	err = __kho_radix_walk_tree(kho_in.radix_tree.root,
+				    KHO_TREE_MAX_DEPTH - 1, 0, &cb, c);
+	if (!err && coalesce)
+		err = kho_early_flush_run(c);
+	return err;
+}
+
+/* Count the reserve calls (ranges) and node pages a walk will make */
+static int __init kho_early_count(bool coalesce, unsigned long *ranges,
+				  unsigned long *nodes)
+{
+	struct kho_early_ctx cnt = { .count_only = true };
+	int err;
+
+	err = kho_early_walk(&cnt, coalesce);
+	*ranges = cnt.ranges;
+	*nodes = cnt.nodes;
+	return err;
+}
+
+static int __init kho_early_cmp_base(const void *a, const void *b)
+{
+	const struct memblock_region *ra = a, *rb = b;
+
+	if (ra->base < rb->base)
+		return -1;
+	return ra->base > rb->base;
+}
+
+/*
+ * KHO_OPT_BULK: build all reservations in one go.
+ *
+ * Count, grow memblock.reserved once, collect the coalesced ranges (NOINIT)
+ * and all radix tree node pages (no flags) into one temporary allocation,
+ * and merge them into memblock.reserved with memblock_reserve_bulk(), which
+ * is linear in the array size. The ranges arrive as a few sorted streams
+ * (one per order), each stream is merged with one call; only if there are
+ * too many streams, the ranges are sorted first. The (few) node pages are
+ * sorted and merged last.
+ *
+ * Both allocations happen while noprsrv-only is still active, so they come
+ * from KHO bootmem and cannot overlap preserved memory or node pages, and
+ * they happen before any range is added. On failure the caller redoes the
+ * reservations with the per-key walk: memblock_reserve_bulk() changes
+ * nothing on error, and reserving the ranges of streams that were already
+ * merged again is harmless.
+ */
+static int __init kho_early_bulk(struct kho_early_ctx *c,
+				 struct kho_early_times *tm)
+{
+	struct memblock_region *rgn = NULL;
+	unsigned long nr_ranges, nr_nodes, n, i;
+	size_t size;
+	u64 t;
+	int err;
+
+	t = local_clock();
+	err = kho_early_count(true, &nr_ranges, &nr_nodes);
+	tm->count = local_clock() - t;
+	if (err)
+		return err;
+	n = nr_ranges + nr_nodes;
+	if (!n)
+		return -EINVAL;
+
+	/* +1 for the temporary array itself */
+	t = local_clock();
+	if (kho_opts & KHO_OPT_DBG_NOMEM)
+		err = -ENOMEM;
+	else
+		err = memblock_reserved_presize(n + 1);
+	tm->presize = local_clock() - t;
+	if (err)
+		return err;
+
+	t = local_clock();
+	size = PAGE_ALIGN(array_size(n, sizeof(*rgn)));
+	if (!(kho_opts & KHO_OPT_DBG_NOMEM))
+		rgn = memblock_alloc_raw(size, PAGE_SIZE);
+	tm->alloc = local_clock() - t;
+	if (!rgn)
+		return -ENOMEM;
+
+	t = local_clock();
+	c->rgn = rgn;
+	c->cap = nr_ranges;
+	c->node_rgn = rgn + nr_ranges;
+	c->cap_nodes = nr_nodes;
+	err = kho_early_walk(c, true);
+	tm->collect = local_clock() - t;
+	if (err)
+		goto out;
+
+	t = local_clock();
+	if (c->unsorted) {
+		sort(rgn, c->nr, sizeof(*rgn), kho_early_cmp_base, NULL);
+		c->nr_streams = 1;
+		c->stream[0] = 0;
+	}
+	sort(c->node_rgn, c->nr_nodes, sizeof(*rgn), kho_early_cmp_base, NULL);
+	tm->sort = local_clock() - t;
+	tm->streams = c->unsorted ? 0 : c->nr_streams;
+
+	t = local_clock();
+	for (i = 0; i < c->nr_streams && !err; i++) {
+		unsigned long end = i + 1 < c->nr_streams ? c->stream[i + 1] :
+				    c->nr;
+
+		err = memblock_reserve_bulk(rgn + c->stream[i],
+					    end - c->stream[i]);
+	}
+	if (!err)
+		err = memblock_reserve_bulk(c->node_rgn, c->nr_nodes);
+	tm->bulk = local_clock() - t;
+
+out:
+	c->rgn = NULL;
+	c->node_rgn = NULL;
+	memblock_free(rgn, size);
+	return err;
+}
+
+/* Binary search of the reserved region containing @addr, or NULL */
+static struct memblock_region *__init kho_early_find_reserved(phys_addr_t addr)
+{
+	struct memblock_type *type = &memblock.reserved;
+	unsigned long lo = 0, hi = type->cnt;
+
+	while (lo < hi) {
+		unsigned long mid = lo + (hi - lo) / 2;
+		struct memblock_region *r = &type->regions[mid];
+
+		if (addr < r->base)
+			hi = mid;
+		else if (addr >= r->base + r->size)
+			lo = mid + 1;
+		else
+			return r;
+	}
+	return NULL;
+}
+
+struct kho_early_check {
+	unsigned long keys, nodes, errors;
+};
+
+static void __init kho_early_check_range(struct kho_early_check *ck,
+					 phys_addr_t base, phys_addr_t size,
+					 bool noinit, const char *what)
+{
+	struct memblock_region *r = kho_early_find_reserved(base);
+
+	if (r && base + size <= r->base + r->size &&
+	    !!(r->flags & MEMBLOCK_RSRV_NOINIT) == noinit)
+		return;
+
+	if (ck->errors++ < 8)
+		pr_err("KHO_BENCH: check: %s [%pa+%pa] not reserved as expected (region flags %#x)\n",
+		       what, &base, &size, r ? r->flags : 0);
+}
+
+static int __init kho_early_check_leaf(unsigned long key, void *data)
+{
+	struct kho_early_check *ck = data;
+	unsigned int order;
+	phys_addr_t phys = kho_decode_radix_key(key, &order);
+
+	ck->keys++;
+	kho_early_check_range(ck, phys, PAGE_SIZE << order, true, "range");
+	return 0;
+}
+
+static int __init kho_early_check_node(phys_addr_t phys, void *data)
+{
+	struct kho_early_check *ck = data;
+
+	ck->nodes++;
+	kho_early_check_range(ck, phys, PAGE_SIZE, false, "node");
+	return 0;
+}
+
+/*
+ * kho_reserve_check=1: verify memblock.reserved after the first walk: sorted,
+ * non-overlapping, adjacent compatible regions merged, total_size consistent,
+ * every preserved block inside a NOINIT region and every node page inside a
+ * reserved region without NOINIT.
+ */
+static void __init kho_early_check_reserved(void)
+{
+	const struct kho_radix_walk_cb cb = {
+		.leaf = kho_early_check_leaf,
+		.node = kho_early_check_node,
+	};
+	struct memblock_type *type = &memblock.reserved;
+	struct kho_early_check ck = { };
+	phys_addr_t total = 0;
+	u64 t0 = local_clock();
+	unsigned long i;
+
+	for (i = 0; i < type->cnt; i++) {
+		struct memblock_region *r = &type->regions[i];
+
+		total += r->size;
+		if (!i)
+			continue;
+		if (r[-1].base + r[-1].size > r->base ||
+		    (r[-1].base + r[-1].size == r->base &&
+		     r[-1].flags == r->flags &&
+		     memblock_get_region_node(&r[-1]) ==
+		     memblock_get_region_node(r))) {
+			if (ck.errors++ < 8)
+				pr_err("KHO_BENCH: check: reserved regions %lu/%lu overlap, unsorted or not merged\n",
+				       i - 1, i);
+		}
+	}
+	if (total != type->total_size || type->cnt > type->max) {
+		ck.errors++;
+		pr_err("KHO_BENCH: check: total_size %pa != %pa or cnt %lu > max %lu\n",
+		       &type->total_size, &total, type->cnt, type->max);
+	}
+
+	__kho_radix_walk_tree(kho_in.radix_tree.root, KHO_TREE_MAX_DEPTH - 1, 0,
+			      &cb, &ck);
+
+	pr_info("KHO_BENCH: mode=%s check %s regions=%lu keys=%lu nodes=%lu errors=%lu t=%lluns\n",
+		kho_reserve_mode_name, ck.errors ? "FAILED" : "ok", type->cnt,
+		ck.keys, ck.nodes, ck.errors, local_clock() - t0);
+	WARN_ON(ck.errors);
+}
+
+/**
+ * kho_reserve_preserved_early - reserve preserved memory early in boot
+ *
+ * Called by the architecture setup code as soon as the direct map covers all
+ * memory, memblock.current_limit is final and memblock can resize its arrays.
+ * With kho_reserve_mode=early*, walks the preserved memory radix tree and
+ * reserves every preserved range and every radix tree node page in memblock.
+ * Allocations made during the walk (memblock array resizing, temporary
+ * arrays) are still restricted to MEMBLOCK_KHO_NOPRSRV memory. Only when the
+ * whole walk succeeded the restriction is lifted. If an optional step fails
+ * before anything was reserved, the plain per-key walk is used instead. If
+ * the walk itself fails the restriction stays and the baseline flow takes
+ * over.
+ */
+void __init kho_reserve_preserved_early(void)
+{
+	struct kho_early_ctx *c = &kho_early_ctx;
+	struct kho_early_times tm = { .fallback = "none" };
+	bool done = false;
+	unsigned long cnt0, n, nodes;
+	void *mem_map;
+	u64 t0, t1, t;
+	int err;
+
+	if (!is_kho_boot() || !kho_in.bootmem_phys || is_kdump_kernel())
+		return;
+
+	kho_opts = kho_reserve_opts_cmdline >= 0 ? kho_reserve_opts_cmdline :
+		   kho_reserve_modes[kho_reserve_mode].opts;
+	pr_info("KHO_BENCH: mode=%s opts=%#x\n", kho_reserve_mode_name,
+		kho_opts);
+
+	if (!kho_reserve_modes[kho_reserve_mode].early)
+		return;
+
+	mem_map = kho_get_mem_map(kho_get_fdt());
+	if (!mem_map)
+		goto fallback;
+
+	/*
+	 * kho_memory_init_early() is skipped in this mode, so initialize what
+	 * it would have initialized. kho_bootmem_overlap() needs kho_bootmem.
+	 */
+	kho_bootmem = phys_to_virt(kho_in.bootmem_phys);
+	if (kho_radix_init_tree(&kho_in.radix_tree, mem_map))
+		goto fallback;
+
+	cnt0 = memblock.reserved.cnt;
+	t0 = local_clock();
+
+	if (kho_opts & KHO_OPT_BULK) {
+		err = kho_early_bulk(c, &tm);
+		if (!err) {
+			done = true;
+		} else {
+			pr_warn("KHO_BENCH: mode=%s bulk FAILED (%pe), falling back to per-key early walk\n",
+				kho_reserve_mode_name, ERR_PTR(err));
+			tm.fallback = "bulk";
+		}
+	} else if (kho_opts & KHO_OPT_PRESIZE) {
+		t = local_clock();
+		err = kho_early_count(kho_opts & KHO_OPT_COALESCE, &n, &nodes);
+		tm.count = local_clock() - t;
+		n += nodes;
+		if (!err) {
+			t = local_clock();
+			if (kho_opts & KHO_OPT_DBG_NOMEM)
+				err = -ENOMEM;
+			else
+				err = memblock_reserved_presize(n);
+			tm.presize = local_clock() - t;
+		}
+		if (err) {
+			pr_warn("KHO_BENCH: mode=%s presize FAILED (%pe), falling back to per-key early walk\n",
+				kho_reserve_mode_name, ERR_PTR(err));
+			tm.fallback = "presize";
+		}
+	}
+
+	if (!done) {
+		if (strcmp(tm.fallback, "none")) {
+			/*
+			 * Start over with the plain per-key walk. Ranges that
+			 * a failed bulk merge already added are reserved again
+			 * with the same result, which is harmless.
+			 */
+			kho_opts &= ~KHO_OPT_WALK1;
+		}
+		memset(c, 0, sizeof(*c));
+		err = kho_early_walk(c, kho_opts & KHO_OPT_COALESCE);
+	}
+	t1 = local_clock();
+	if (err) {
+		/*
+		 * noprsrv-only is still active, so nothing has been allocated
+		 * outside of KHO bootmem. kho_memory_init_early() and
+		 * kho_mem_retrieve() will redo the work; reserving an already
+		 * reserved range again is harmless.
+		 */
+		pr_err("KHO_BENCH: mode=%s walk1 FAILED (%pe) after keys=%lu nodes=%lu t=%lluns, falling back to baseline\n",
+		       kho_reserve_mode_name, ERR_PTR(err), c->keys,
+		       c->nodes, t1 - t0);
+		goto fallback;
+	}
+
+	if (kho_reserve_check)
+		kho_early_check_reserved();
+
+	memblock_clear_kho_noprsrv_only();
+	kho_early_reserved = true;
+
+	pr_info("KHO_BENCH: mode=%s walk1 keys=%lu nodes=%lu bytes=%llu reserved.cnt=%lu->%lu max=%lu t=%lluns ranges=%lu node_t=%lluns count_t=%lluns presize_t=%lluns alloc_t=%lluns collect_t=%lluns sort_t=%lluns bulk_t=%lluns streams=%u opts=%#x fallback=%s\n",
+		kho_reserve_mode_name, c->keys, c->nodes, c->bytes, cnt0,
+		memblock.reserved.cnt, memblock.reserved.max, t1 - t0,
+		c->ranges, c->node_ns, tm.count, tm.presize, tm.alloc,
+		tm.collect, tm.sort, tm.bulk, tm.streams, kho_opts,
+		tm.fallback);
+	return;
+
+fallback:
+	pr_warn("KHO_BENCH: mode=%s not possible, falling back to baseline\n",
+		kho_reserve_mode_name);
+	kho_reserve_mode = 0;
+	kho_opts = 0;
+}
+
 void __init kho_memory_init_early(void)
 {
 	const void *fdt = kho_get_fdt();
 	void *mem_map;
+	u64 t0;
 
 	if (!is_kho_boot())
+		return;
+
+	/*
+	 * kho_reserve_preserved_early() already set up the radix tree and
+	 * kho_bootmem, and lifted the noprsrv-only restriction, so there is no
+	 * need to discover extra allocatable memory.
+	 */
+	if (kho_early_reserved)
 		return;
 
 	/*
@@ -1962,7 +2838,10 @@ void __init kho_memory_init_early(void)
 	if (kho_radix_init_tree(&kho_in.radix_tree, mem_map))
 		goto err;
 
+	t0 = local_clock();
 	kho_discover_noprsrv();
+	pr_info("KHO_BENCH: mode=%s discover t=%lluns\n",
+		kho_reserve_mode_name, local_clock() - t0);
 
 	return;
 
@@ -1983,10 +2862,14 @@ void __init kho_memory_init(void)
 		return;
 	}
 
-	if (kho_in.bootmem_phys)
-		kho_mem_retrieve();
-	else
+	if (kho_in.bootmem_phys) {
+		if (kho_early_reserved)
+			kho_mem_init_pages();
+		else
+			kho_mem_retrieve();
+	} else {
 		kho_reserve_bootmem();
+	}
 }
 
 void __init kho_populate(phys_addr_t fdt_phys, u64 fdt_len,

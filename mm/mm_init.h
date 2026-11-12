@@ -66,6 +66,8 @@ static inline bool deferred_pages_enabled(void)
 #endif /* CONFIG_DEFERRED_STRUCT_PAGE_INIT */
 
 void init_deferred_page(unsigned long pfn, int nid);
+unsigned long init_deferred_page_range(unsigned long pfn,
+				      unsigned long end_pfn);
 
 enum mminit_level {
 	MMINIT_WARNING,
@@ -108,6 +110,9 @@ static inline void mminit_verify_zonelist(void)
 extern bool mirrored_kernelcore;
 bool memblock_has_mirror(void);
 void memblock_free_all(void);
+/* KHO benchmark timers of the two phases of memblock_free_all() */
+extern u64 memblock_bench_reserved_pages_ns;
+extern u64 memblock_bench_free_ranges_ns;
 
 void __meminit __init_single_page(struct page *page, unsigned long pfn,
 				unsigned long zone, int nid);

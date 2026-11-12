@@ -1,0 +1,69 @@
+# SPDX-License-Identifier: GPL-2.0
+# M2 sweep plan for m2_sweep.sh (kho_sweep.py).
+# Columns (whitespace separated):
+#   phase variant pattern count target kind opts
+# variant: baseline | early | both (= baseline and early, interleaved)
+# kind:    ok      -> point done when it has >= target rows with status=ok
+#          attempt -> point done when it has >= target rows of any status
+#                     (used where the outcome may be ENOMEM or a timeout;
+#                     a timeout is recorded as a lower bound only)
+# opts:    - | comma list of "verify" and kho_bench k=v params (e.g.
+#          verify,fill=1).  Verify rows go to <outdir>/verify/data.csv.
+# Phases run in order; inside a phase the runs of every point are spread
+# over rounds so variants/patterns interleave.  Points whose ok runs show
+# kernel-B time-to-init > 60 s are reduced to 3 runs automatically.
+#
+# phase 1: floor + cheap counts
+1 both     none     0        5 ok -
+1 both     contig   1000     5 ok -
+1 both     alt      1000     5 ok -
+1 both     random   1000     5 ok -
+1 both     mixed    1000     5 ok -
+1 both     inverted 1000     5 ok -
+1 both     contig   4096     5 ok -
+1 both     alt      4096     5 ok -
+1 both     random   4096     5 ok -
+1 both     mixed    4096     5 ok -
+1 both     inverted 4096     5 ok -
+1 both     contig   10000    5 ok -
+1 both     alt      10000    5 ok -
+1 both     random   10000    5 ok -
+1 both     inverted 10000    5 ok -
+1 both     contig   32768    5 ok -
+1 both     alt      32768    5 ok -
+1 both     random   32768    5 ok -
+1 both     inverted 32768    5 ok -
+1 both     contig   100000   5 ok -
+1 both     alt      100000   5 ok -
+1 both     random   100000   5 ok -
+1 both     inverted 100000   5 ok -
+1 both     contig   262144   5 ok -
+1 both     alt      262144   5 ok -
+1 both     random   262144   5 ok -
+1 both     inverted 262144   5 ok -
+# phase 2: large counts of the cheap patterns (up to max feasible)
+2 both     contig   1048576  5 ok -
+2 both     alt      1048576  5 ok -
+2 both     random   1048576  5 ok -
+2 both     contig   2097152  5 ok -
+2 both     alt      2097152  5 ok -
+2 both     random   1572864  5 attempt -
+2 both     contig   4194304  5 ok -
+2 both     alt      4194304  5 ok -
+2 both     contig   8388608  5 ok -
+# phase 3: correctness (full-content verify) once per pattern, early variant
+3 early    contig   8388608  1 attempt verify,fill=1
+3 early    alt      4194304  1 attempt verify,fill=1
+3 early    random   1048576  1 attempt verify,fill=1
+3 early    mixed    32768    1 attempt verify,fill=1
+3 early    inverted 1048576  1 attempt verify,fill=1
+# phase 4: mixed (slow generation in A)
+4 both     mixed    10000    5 ok -
+4 both     mixed    32768    5 ok -
+4 both     mixed    40960    3 attempt -
+# phase 5: inverted, slow kernel B (> 60 s -> 3 runs)
+5 both     inverted 524288   3 ok -
+5 both     inverted 1048576  3 ok -
+# phase 6: 2M inverted attempt (B_TIMEOUT 1500 s; timeout = lower bound)
+6 early    inverted 2097152  1 attempt -
+6 baseline inverted 2097152  1 attempt -

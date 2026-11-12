@@ -1,0 +1,126 @@
+# SPDX-License-Identifier: GPL-2.0
+# M3 sweep plan for m3_sweep.sh (scripts/m3/kho_sweep.py).
+# Columns (whitespace separated):
+#   phase variant pattern count target kind opts
+# variant: a mode name (baseline, early, early_noinit1, early_coalesce,
+#          early_presize, early_bulk, early_nodefree, early_batchinit,
+#          early_opt) | both (= baseline + early) | opt (= the 7 early_*
+#          modes) | all (= all 9)
+# kind:    ok      -> point done when it has >= target rows with status=ok
+#          attempt -> point done when it has >= target rows of any status
+#                     (outcome may be ENOMEM or a timeout; a timeout is a
+#                     measured lower bound only)
+# opts:    - | comma list of "verify", kho_bench k=v params (e.g. fill=1) and
+#          bt=<s> (kernel B timeout in s for this point, default 1500 from
+#          run_point.sh / env B_TIMEOUT).  Verify rows go to
+#          <outdir>/verify/data.csv.
+# Auto-caps of kho_sweep.py apply (ENOMEM skip, timeout/slow -> single
+# attempt for larger counts, median > 60 s -> 3 runs, GIVEUP).
+#
+# Revision 3 (m3_worker_2, parent guidance 10:39Z: total wall <= ~5 h from
+# 10:17Z, essential data first).  Phases are in priority order; each phase
+# runs round-robin (round k gives every point of the phase its k-th run, in
+# plan order).  Trimmed vs rev 1/2 (rows already measured stay in data.csv
+# and are reported):
+#  - no slow baseline/early re-measurement at inverted >= 524288 (no 1M n=3,
+#    no 2M attempt); M2's numbers are cited for those (different session);
+#  - the five quadratic single modes (noinit1, coalesce, presize, nodefree,
+#    batchinit) stop at inverted 262144 (3 runs); early_bulk goes to 2M;
+#  - single modes get 3 runs, small counts dropped for them;
+#  - baseline/early references only at cheap counts.
+#
+# phase 1: early_opt full ladders on all 5 patterns + none/0 floor per mode
+1 all       none     0        3 ok -
+1 early_opt none     0        5 ok -
+1 early_opt inverted 1000     5 ok -
+1 early_opt inverted 4096     5 ok -
+1 early_opt inverted 10000    5 ok -
+1 early_opt inverted 32768    5 ok -
+1 early_opt inverted 100000   5 ok -
+1 early_opt inverted 262144   5 ok -
+1 early_opt inverted 524288   5 ok -
+1 early_opt inverted 1048576  5 ok -
+1 early_opt inverted 2097152  5 ok -
+1 early_opt inverted 4194304  1 attempt -
+1 early_opt alt      1000     5 ok -
+1 early_opt alt      4096     5 ok -
+1 early_opt alt      10000    5 ok -
+1 early_opt alt      32768    5 ok -
+1 early_opt alt      100000   5 ok -
+1 early_opt alt      262144   5 ok -
+1 early_opt alt      1048576  5 ok -
+1 early_opt alt      2097152  5 ok -
+1 early_opt alt      4194304  5 ok -
+1 early_opt random   1000     5 ok -
+1 early_opt random   4096     5 ok -
+1 early_opt random   10000    5 ok -
+1 early_opt random   32768    5 ok -
+1 early_opt random   100000   5 ok -
+1 early_opt random   262144   5 ok -
+1 early_opt random   1048576  5 ok -
+1 early_opt random   1572864  3 attempt -
+1 early_opt contig   1000     5 ok -
+1 early_opt contig   10000    5 ok -
+1 early_opt contig   100000   5 ok -
+1 early_opt contig   1048576  5 ok -
+1 early_opt contig   4194304  5 ok -
+1 early_opt contig   8388608  5 ok -
+1 early_opt mixed    1000     5 ok -
+1 early_opt mixed    4096     5 ok -
+1 early_opt mixed    10000    5 ok -
+1 early_opt mixed    32768    5 ok -
+1 early_opt mixed    40960    5 ok -
+#
+# phase 2: each single mode on the inverted and alt ladders
+2 opt       inverted 100000   3 ok -
+2 opt       inverted 262144   3 ok -
+2 early_bulk inverted 524288  3 ok -
+2 early_bulk inverted 1048576 3 ok -
+2 early_bulk inverted 2097152 3 ok -
+2 opt       alt      100000   3 ok -
+2 opt       alt      262144   3 ok -
+2 opt       alt      1048576  3 ok -
+2 opt       alt      4194304  3 ok -
+#
+# phase 3: correctness at large counts (full-content verify, fill=1)
+3 early_opt       inverted 2097152 1 ok verify,fill=1
+3 early_opt       alt      4194304 1 ok verify,fill=1
+3 early_opt       random   1048576 1 ok verify,fill=1
+3 early_opt       contig   8388608 1 ok verify,fill=1
+3 early_opt       mixed    32768   1 ok verify,fill=1
+3 early_bulk      inverted 2097152 1 ok verify,fill=1
+3 early_bulk      alt      4194304 1 ok verify,fill=1
+3 early_noinit1   inverted 262144  1 ok verify,fill=1
+3 early_noinit1   alt      4194304 1 ok verify,fill=1
+3 early_coalesce  inverted 262144  1 ok verify,fill=1
+3 early_coalesce  alt      4194304 1 ok verify,fill=1
+3 early_coalesce  contig   8388608 1 ok verify,fill=1
+3 early_presize   inverted 262144  1 ok verify,fill=1
+3 early_presize   alt      4194304 1 ok verify,fill=1
+3 early_nodefree  inverted 262144  1 ok verify,fill=1
+3 early_nodefree  alt      4194304 1 ok verify,fill=1
+3 early_batchinit inverted 262144  1 ok verify,fill=1
+3 early_batchinit alt      4194304 1 ok verify,fill=1
+#
+# phase 4: single modes on random (+ coalesce on contig, its target case)
+4 opt       random   262144   3 ok -
+4 opt       random   1048576  3 ok -
+4 early_coalesce contig 1048576 3 ok -
+4 early_coalesce contig 8388608 3 ok -
+#
+# phase 5: same-session baseline/early references at cheap counts
+5 both      inverted 100000   5 ok -
+5 both      inverted 262144   3 ok -
+5 both      alt      1048576  5 ok -
+5 both      alt      4194304  5 ok -
+5 both      random   1048576  5 ok -
+5 both      contig   8388608  5 ok -
+5 both      mixed    32768    5 ok -
+#
+# phase 6 (added after phases 1-5, time permitting): beyond 2M for the
+# worst-case pattern.  inverted 4M was measured once in phase 1 (attempt);
+# bring it to 3 runs and try 8M (kernel A generation may fail with ENOMEM:
+# the 4M layout already spans pfn 0x140000-0xdffffd of the 64 GiB guest).
+6 early_opt inverted 4194304  3 attempt -
+6 early_bulk inverted 4194304 3 attempt -
+6 early_opt inverted 8388608  1 attempt -

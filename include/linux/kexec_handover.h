@@ -35,6 +35,7 @@ int kho_retrieve_subtree(const char *name, phys_addr_t *phys, size_t *size);
 
 void kho_memory_init(void);
 void kho_memory_init_early(void);
+void kho_reserve_preserved_early(void);
 
 void kho_populate(phys_addr_t fdt_phys, u64 fdt_len, phys_addr_t bootmem_phys,
 		  u64 bootmem_len);
@@ -121,6 +122,8 @@ static inline int kho_retrieve_subtree(const char *name, phys_addr_t *phys,
 static inline void kho_memory_init(void) { }
 
 static inline void kho_memory_init_early(void) { }
+
+static inline void kho_reserve_preserved_early(void) { }
 
 static inline void kho_populate(phys_addr_t fdt_phys, u64 fdt_len,
 				phys_addr_t bootmem_phys, u64 bootmem_len)

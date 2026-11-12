@@ -131,6 +131,8 @@ int memblock_remove(phys_addr_t base, phys_addr_t size);
 int memblock_phys_free(phys_addr_t base, phys_addr_t size);
 int __memblock_reserve(phys_addr_t base, phys_addr_t size, int nid,
 		       enum memblock_flags flags);
+int memblock_reserved_presize(unsigned long nr);
+int memblock_reserve_bulk(const struct memblock_region *rgn, unsigned long n);
 
 static __always_inline int memblock_reserve(phys_addr_t base, phys_addr_t size)
 {

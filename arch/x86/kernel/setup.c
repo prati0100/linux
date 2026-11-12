@@ -1158,6 +1158,12 @@ void __init setup_arch(char **cmdline_p)
 	memblock_set_current_limit(get_max_mapped());
 
 	/*
+	 * All memory is mapped and memblock can resize: on a KHO boot, reserve
+	 * the preserved memory now if requested (kho_reserve_mode=early).
+	 */
+	kho_reserve_preserved_early();
+
+	/*
 	 * NOTE: On x86-32, only from this point on, fixmaps are ready for use.
 	 */
 

@@ -17,6 +17,7 @@
 #include <linux/seq_file.h>
 #include <linux/memblock.h>
 #include <linux/mutex.h>
+#include <linux/sched/clock.h>
 #include <linux/string_helpers.h>
 
 #include <linux/libfdt.h>
@@ -407,23 +408,25 @@ void __init memblock_discard(void)
 #endif
 
 /**
- * memblock_double_array - double the size of the memblock regions array
- * @type: memblock type of the regions array being doubled
+ * memblock_resize_array - grow the memblock regions array
+ * @type: memblock type of the regions array being resized
+ * @new_max: new number of entries, must be larger than @type->max
  * @new_area_start: starting address of memory range to avoid overlap with
  * @new_area_size: size of memory range to avoid overlap with
  *
- * Double the size of the @type regions array. If memblock is being used to
- * allocate memory for a new reserved regions array and there is a previously
- * allocated memory range [@new_area_start, @new_area_start + @new_area_size]
- * waiting to be reserved, ensure the memory used by the new array does
- * not overlap.
+ * Grow the @type regions array to @new_max entries. If memblock is being used
+ * to allocate memory for a new reserved regions array and there is a
+ * previously allocated memory range
+ * [@new_area_start, @new_area_start + @new_area_size] waiting to be reserved,
+ * ensure the memory used by the new array does not overlap.
  *
  * Return:
  * 0 on success, -1 on failure.
  */
-static int __init_memblock memblock_double_array(struct memblock_type *type,
-						phys_addr_t new_area_start,
-						phys_addr_t new_area_size)
+static int __init_memblock memblock_resize_array(struct memblock_type *type,
+						 unsigned long new_max,
+						 phys_addr_t new_area_start,
+						 phys_addr_t new_area_size)
 {
 	struct memblock_region *new_array, *old_array;
 	phys_addr_t old_alloc_size, new_alloc_size;
@@ -437,9 +440,12 @@ static int __init_memblock memblock_double_array(struct memblock_type *type,
 	if (!memblock_can_resize)
 		panic("memblock: cannot resize %s array\n", type->name);
 
-	/* Calculate new doubled size */
+	if (WARN_ON_ONCE(new_max <= type->max))
+		return -1;
+
+	/* Calculate new size */
 	old_size = type->max * sizeof(struct memblock_region);
-	new_size = old_size << 1;
+	new_size = new_max * sizeof(struct memblock_region);
 	/*
 	 * We need to allocated new one align to PAGE_SIZE,
 	 *   so we can free them completely later.
@@ -480,14 +486,14 @@ static int __init_memblock memblock_double_array(struct memblock_type *type,
 		}
 	}
 	if (!addr) {
-		pr_err("memblock: Failed to double %s array from %ld to %ld entries !\n",
-		       type->name, type->max, type->max * 2);
+		pr_err("memblock: Failed to resize %s array from %ld to %ld entries !\n",
+		       type->name, type->max, new_max);
 		return -1;
 	}
 
 	new_end = addr + new_size - 1;
-	memblock_dbg("memblock: %s is doubled to %ld at [%pa-%pa]",
-			type->name, type->max * 2, &addr, &new_end);
+	memblock_dbg("memblock: %s is resized to %ld at [%pa-%pa]",
+			type->name, new_max, &addr, &new_end);
 
 	/*
 	 * Found space, we now need to move the array over before we add the
@@ -495,10 +501,10 @@ static int __init_memblock memblock_double_array(struct memblock_type *type,
 	 * full.
 	 */
 	memcpy(new_array, type->regions, old_size);
-	memset(new_array + type->max, 0, old_size);
+	memset(new_array + type->max, 0, new_size - old_size);
 	old_array = type->regions;
 	type->regions = new_array;
-	type->max <<= 1;
+	type->max = new_max;
 
 	/* Free old array. We needn't free it if the array is the static one */
 	if (*in_slab)
@@ -517,6 +523,141 @@ static int __init_memblock memblock_double_array(struct memblock_type *type,
 	/* Update slab flag */
 	*in_slab = use_slab;
 
+	return 0;
+}
+
+/**
+ * memblock_double_array - double the size of the memblock regions array
+ * @type: memblock type of the regions array being doubled
+ * @new_area_start: starting address of memory range to avoid overlap with
+ * @new_area_size: size of memory range to avoid overlap with
+ *
+ * See memblock_resize_array().
+ *
+ * Return:
+ * 0 on success, -1 on failure.
+ */
+static int __init_memblock memblock_double_array(struct memblock_type *type,
+						phys_addr_t new_area_start,
+						phys_addr_t new_area_size)
+{
+	return memblock_resize_array(type, type->max << 1, new_area_start,
+				     new_area_size);
+}
+
+/**
+ * memblock_reserved_presize - grow memblock.reserved once for @nr more regions
+ * @nr: number of regions about to be added
+ *
+ * Grow the reserved regions array in a single step so that @nr regions can be
+ * added without any further resizing, and so that memblock_add_range() keeps
+ * using its single pass (it needs room for twice the current count). Some
+ * slack is left for the regions the caller and memblock itself may add (the
+ * new array, temporary allocations, splits by memblock_isolate_range()).
+ *
+ * Like any memblock allocation, the new array honours the KHO noprsrv-only
+ * restriction when it is active.
+ *
+ * Return: 0 on success (also when the array is already large enough),
+ * -ENOMEM if the new array could not be allocated (array unchanged).
+ */
+int __init memblock_reserved_presize(unsigned long nr)
+{
+	struct memblock_type *type = &memblock.reserved;
+	unsigned long want = 2 * (type->cnt + nr) + 64;
+
+	if (want <= type->max)
+		return 0;
+
+	return memblock_resize_array(type, want, 0, 0) ? -ENOMEM : 0;
+}
+
+/**
+ * memblock_reserve_bulk - add many sorted ranges to memblock.reserved at once
+ * @rgn: ranges sorted by base, non-overlapping (adjacent ranges are allowed),
+ *       each with its own flags and node id
+ * @n: number of ranges in @rgn
+ *
+ * The result is the same as calling __memblock_reserve() for every range,
+ * provided that no range overlaps an already reserved region, but it runs in
+ * O(@n + memblock.reserved.cnt): the new ranges are merged into the sorted
+ * array from its tail and adjacent compatible regions are then merged in one
+ * linear pass.
+ *
+ * This function never allocates. The caller must have made room for the new
+ * ranges with memblock_reserved_presize() beforehand.
+ *
+ * Return: 0 on success, -EINVAL if @rgn is not sorted, has an empty range or
+ * has overlapping ranges, -EBUSY if a range overlaps an existing reserved
+ * region, -ENOMEM if the array has no room. memblock.reserved is not
+ * modified on error.
+ */
+int __init memblock_reserve_bulk(const struct memblock_region *rgn,
+				 unsigned long n)
+{
+	struct memblock_type *type = &memblock.reserved;
+	unsigned long i, j, k, w, cnt, total;
+	phys_addr_t added = 0;
+
+	if (!n)
+		return 0;
+
+	/* Validate the input and check for overlaps; read-only. */
+	for (i = 0, j = 0; j < n; j++) {
+		phys_addr_t base = rgn[j].base, end = base + rgn[j].size;
+
+		if (!rgn[j].size || end < base)
+			return -EINVAL;
+		if (j && rgn[j - 1].base + rgn[j - 1].size > base)
+			return -EINVAL;
+		while (i < type->cnt &&
+		       type->regions[i].base + type->regions[i].size <= base)
+			i++;
+		if (i < type->cnt && type->regions[i].base < end)
+			return -EBUSY;
+		added += rgn[j].size;
+	}
+
+	/*
+	 * Leave the same headroom memblock_isolate_range() needs, so that
+	 * later operations on the array never have to resize it right away.
+	 */
+	if (type->cnt + n + 8 > type->max)
+		return -ENOMEM;
+
+	/*
+	 * Backward merge of two sorted sequences. Writing starts at the end
+	 * of the combined array, so it never overwrites an unread region.
+	 */
+	cnt = type->cnt;
+	total = cnt + n;
+	i = cnt;
+	j = n;
+	k = total;
+	while (j) {
+		if (i && type->regions[i - 1].base > rgn[j - 1].base)
+			type->regions[--k] = type->regions[--i];
+		else
+			type->regions[--k] = rgn[--j];
+	}
+	/* regions[0..i) are already in place, k == i here */
+
+	/* Forward pass: merge adjacent regions with equal flags and nid. */
+	for (w = 0, k = 1; k < total; k++) {
+		struct memblock_region *a = &type->regions[w];
+		struct memblock_region *b = &type->regions[k];
+
+		if (a->base + a->size == b->base && a->flags == b->flags &&
+		    memblock_get_region_node(a) == memblock_get_region_node(b))
+			a->size += b->size;
+		else
+			type->regions[++w] = *b;
+	}
+	type->cnt = w + 1;
+	type->total_size += added;
+
+	memblock_dbg("%s: %lu ranges, cnt %lu -> %lu %pS\n", __func__, n, cnt,
+		     type->cnt, (void *)_RET_IP_);
 	return 0;
 }
 
@@ -2417,24 +2558,32 @@ repeat:
 	}
 }
 
+/* KHO benchmark: split of free_low_memory_core_early(), printed by mm_init.c */
+u64 memblock_bench_reserved_pages_ns __initdata;
+u64 memblock_bench_free_ranges_ns __initdata;
+
 static unsigned long __init free_low_memory_core_early(void)
 {
 	unsigned long count = 0;
 	phys_addr_t start, end;
-	u64 i;
+	u64 i, t0;
 
 	memblock_clear_hotplug(0, -1);
 
+	t0 = local_clock();
 	memmap_init_reserved_pages();
+	memblock_bench_reserved_pages_ns = local_clock() - t0;
 
 	/*
 	 * We need to use NUMA_NO_NODE instead of NODE_DATA(0)->node_id
 	 *  because in some case like Node0 doesn't have RAM installed
 	 *  low ram will be on Node1
 	 */
+	t0 = local_clock();
 	for_each_free_mem_range(i, NUMA_NO_NODE, MEMBLOCK_NONE, &start, &end,
 				NULL)
 		count += __free_memory_core(start, end);
+	memblock_bench_free_ranges_ns = local_clock() - t0;
 
 	return count;
 }

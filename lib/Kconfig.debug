@@ -3450,6 +3450,19 @@ config TEST_KEXEC_HANDOVER
 
 	  If unsure, say N.
 
+config TEST_KHO_BENCH
+	bool "KHO preservation pattern generator for benchmarking"
+	depends on KEXEC_HANDOVER && CONTIG_ALLOC && DEBUG_FS
+	help
+	  Creates KHO preservations with a controlled physical layout
+	  (contig, alt, mixed, inverted, random) on request through debugfs,
+	  so the cost of reserving preserved memory in the next kernel can be
+	  measured. The next kernel only looks up the generator metadata at
+	  boot; the preserved contents are verified on request through
+	  debugfs.
+
+	  If unsure, say N.
+
 config RATELIMIT_KUNIT_TEST
 	tristate "KUnit Test for correctness and stress of ratelimit" if !KUNIT_ALL_TESTS
 	depends on KUNIT

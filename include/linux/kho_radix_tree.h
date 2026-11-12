@@ -43,6 +43,9 @@ struct kho_radix_tree {
  * @leaf:      Called on each present key in the radix tree.
  * @node:      Called on each node of the radix tree itself. Receives the
  *             physical address of the page containing the node.
+ * @leaf_bitmap: Optional. If set, called once per leaf with the whole bitmap
+ *             instead of calling @leaf for every set bit. @key_base is the
+ *             key of bit 0 and @nbits the number of bits in @bitmap.
  *
  * For each callback, a return value of 0 continues the walk and a non-zero
  * return value is directly returned to the caller.
@@ -50,6 +53,8 @@ struct kho_radix_tree {
 struct kho_radix_walk_cb {
 	int (*leaf)(unsigned long key, void *data);
 	int (*node)(phys_addr_t phys, void *data);
+	int (*leaf_bitmap)(unsigned long key_base, const unsigned long *bitmap,
+			   unsigned int nbits, void *data);
 };
 
 #ifdef CONFIG_KEXEC_HANDOVER

@@ -1,0 +1,13 @@
+# Raw serial/harness logs and intermediate outputs. Kept on disk locally,
+# not committed. Everything needed to follow up is in REPORT.md, graphs/,
+# results/*/{data,summary}.csv, results/*/summary.md, scripts/ and patches/.
+raw/
+smoke/
+probe/
+*.log
+*.out
+*.out.run
+*.status
+*.tlog
+/challenger*/
+/results/m3/graphs/
