@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * kexec_handover_debugfs.c - kexec handover debugfs interfaces
+ * kho_debugfs.c - kexec handover debugfs interfaces
  * Copyright (C) 2023 Alexander Graf <graf@amazon.com>
  * Copyright (C) 2025 Microsoft Corporation, Mike Rapoport <rppt@kernel.org>
  * Copyright (C) 2025 Google LLC, Changyuan Lyu <changyuanl@google.com>
@@ -13,7 +13,7 @@
 #include <linux/libfdt.h>
 #include <linux/mm.h>
 #include <linux/kho/abi/kexec_handover.h>
-#include "kexec_handover_internal.h"
+#include "kho_internal.h"
 
 static struct dentry *debugfs_root;
 

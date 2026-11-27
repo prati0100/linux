@@ -61,7 +61,7 @@
 #include <linux/sizes.h>
 #include <linux/string.h>
 
-#include "kexec_handover_internal.h"
+#include "kho_internal.h"
 #include "luo_internal.h"
 
 static struct {
