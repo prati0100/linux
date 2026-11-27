@@ -207,7 +207,7 @@
 #include <linux/io.h>
 #include <linux/kexec_handover.h>
 #include <linux/kho/abi/pci.h>
-#include <linux/kho_block.h>
+#include <linux/kho/block.h>
 #include <linux/liveupdate.h>
 #include <linux/mm.h>
 #include <linux/mutex.h>

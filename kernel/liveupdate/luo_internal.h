@@ -10,7 +10,7 @@
 
 #include <linux/liveupdate.h>
 #include <linux/uaccess.h>
-#include <linux/kho_block.h>
+#include <linux/kho/block.h>
 
 struct luo_ucmd {
 	void __user *ubuffer;
