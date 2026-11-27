@@ -1584,7 +1584,7 @@ EXPORT_SYMBOL_GPL(kho_restore_vmalloc);
  * Note: The actual allocated size will be rounded up to the nearest
  * power-of-two page boundary.
  *
- * @return A virtual pointer to the allocated and preserved memory on success,
+ * Return: A virtual pointer to the allocated and preserved memory on success,
  * or an ERR_PTR() encoded error on failure.
  */
 void *kho_alloc_preserve(size_t size)
