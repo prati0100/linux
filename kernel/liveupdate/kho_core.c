@@ -390,100 +390,161 @@ void kho_radix_destroy_tree(struct kho_radix_tree *tree)
 }
 EXPORT_SYMBOL_GPL(kho_radix_destroy_tree);
 
-static int kho_radix_walk_leaf(struct kho_radix_leaf *leaf, unsigned long key,
-			       const struct kho_radix_walk_cb *cb, void *data)
+/* Number of keys covered by a node at @level. */
+static unsigned long kho_radix_span(unsigned int level)
 {
-	unsigned long *bitmap = (unsigned long *)leaf;
-	unsigned int i;
-	int err;
-
-	if (cb->node) {
-		err = cb->node(virt_to_phys(leaf), data);
-		if (err)
-			return err;
-	}
-
-	if (!cb->leaf)
-		return 0;
-
-	for_each_set_bit(i, bitmap, PAGE_SIZE * BITS_PER_BYTE) {
-		err = cb->leaf(key | i, data);
-		if (err)
-			return err;
-	}
-
-	return 0;
+	return 1UL << (level * KHO_TABLE_SIZE_LOG2 + KHO_BITMAP_SIZE_LOG2);
 }
 
-static int __kho_radix_walk_tree(struct kho_radix_node *root,
-				 unsigned int level, unsigned long start,
-				 const struct kho_radix_walk_cb *cb, void *data)
+static unsigned long __kho_radix_next_leaf(struct kho_radix_leaf *leaf,
+					   unsigned long key)
 {
-	struct kho_radix_node *node;
-	struct kho_radix_leaf *leaf;
-	unsigned long key, i;
-	unsigned int shift;
-	int err;
+	unsigned long nbits = 1UL << KHO_BITMAP_SIZE_LOG2;
+	unsigned long i;
 
-	if (cb->node) {
-		err = cb->node(virt_to_phys(root), data);
-		if (err)
-			return err;
-	}
+	i = find_next_bit(leaf->bitmap, nbits, kho_radix_get_bitmap_index(key));
+	if (i >= nbits)
+		return ULONG_MAX;
 
-	for (i = 0; i < PAGE_SIZE / sizeof(phys_addr_t); i++) {
-		if (!root->table[i])
+	return round_down(key, nbits) | i;
+}
+
+static unsigned long __kho_radix_next(struct kho_radix_node *node,
+				      unsigned int level, unsigned long key)
+{
+	/* Number of keys covered by a single entry at this level. */
+	unsigned long span = kho_radix_span(level - 1);
+	unsigned long found;
+	unsigned int i;
+
+	/*
+	 * The first entry is searched starting from key. Every following
+	 * entry is searched from the first key of the subnode.
+	 */
+	for (i = kho_radix_get_table_index(key, level);
+	     i < (1 << KHO_TABLE_SIZE_LOG2);
+	     i++, key = round_down(key, span) + span) {
+		struct kho_radix_node *next;
+
+		if (!node->table[i])
 			continue;
 
-		shift = ((level - 1) * KHO_TABLE_SIZE_LOG2) +
-			KHO_BITMAP_SIZE_LOG2;
-		key = start | (i << shift);
+		next = phys_to_virt(node->table[i]);
+		if (level == 1)
+			found = __kho_radix_next_leaf((struct kho_radix_leaf *)next,
+						      key);
+		else
+			found = __kho_radix_next(next, level - 1, key);
 
-		node = phys_to_virt(root->table[i]);
-
-		if (level == 1) {
-			/*
-			 * we are at level 1,
-			 * node is pointing to the level 0 bitmap.
-			 */
-			leaf = (struct kho_radix_leaf *)node;
-			err = kho_radix_walk_leaf(leaf, key, cb, data);
-		} else {
-			err  = __kho_radix_walk_tree(node, level - 1,
-						     key, cb, data);
-		}
-
-		if (err)
-			return err;
+		if (found != ULONG_MAX)
+			return found;
 	}
 
-	return 0;
+	return ULONG_MAX;
 }
 
 /**
- * kho_radix_walk_tree - Traverses the radix tree and calls a callback for each key.
- * @tree: A pointer to the KHO radix tree to walk.
- * @cb:   Set of callbacks to be invoked during the tree walk.
- * @data: Opaque data pointer passed to each callback in @cb.
+ * kho_radix_next - Find the next key in the radix tree.
+ * @tree: The KHO radix tree.
+ * @key: Key to start searching from.
  *
- * This function walks the radix tree, searching from the top level down to the
- * lowest level (level 0), invoking the appropriate callbacks.
+ * Finds the smallest key present in @tree that is greater than or equal to
+ * @key.
  *
- * Return: 0 if the walk completed the specified tree, or the non-zero return
- *         value from the callback that stopped the walk.
+ * Return: The key found, or %ULONG_MAX if there is none. %ULONG_MAX is never
+ * a valid key, since it is wider than %KHO_RADIX_KEY_WIDTH.
  */
-int kho_radix_walk_tree(struct kho_radix_tree *tree,
-			const struct kho_radix_walk_cb *cb, void *data)
+unsigned long kho_radix_next(struct kho_radix_tree *tree, unsigned long key)
 {
 	if (WARN_ON_ONCE(!tree->root))
-		return -EINVAL;
+		return ULONG_MAX;
+
+	if (unlikely(fls64(key) > KHO_RADIX_KEY_WIDTH))
+		return ULONG_MAX;
 
 	guard(mutex)(&tree->lock);
 
-	return __kho_radix_walk_tree(tree->root, KHO_TREE_MAX_DEPTH - 1, 0, cb,
-				     data);
+	return __kho_radix_next(tree->root, KHO_TREE_MAX_DEPTH - 1, key);
 }
-EXPORT_SYMBOL_GPL(kho_radix_walk_tree);
+EXPORT_SYMBOL_GPL(kho_radix_next);
+
+/*
+ * Nodes are ordered by the first key they cover, and nodes that cover the
+ * same first key by decreasing level. This is the pre-order of the tree. Find
+ * the first node in the subtree of @node, which covers keys from @start, that
+ * is at or after the position (*@key, *@level) in that order.
+ */
+static void *__kho_radix_next_node(struct kho_radix_node *node,
+				   unsigned int level, unsigned long start,
+				   unsigned long *key, unsigned int *pos_level)
+{
+	unsigned long span;
+	unsigned int i;
+	void *found;
+
+	if (start > *key || (start == *key && level <= *pos_level)) {
+		*key = start;
+		*pos_level = level;
+		return node;
+	}
+
+	if (level == 0)
+		return NULL;
+
+	/*
+	 * *key is covered by this node. Children before the one covering *key
+	 * are entirely before the position, so skip them.
+	 */
+	span = kho_radix_span(level - 1);
+	for (i = kho_radix_get_table_index(*key, level);
+	     i < (1 << KHO_TABLE_SIZE_LOG2); i++) {
+		if (!node->table[i])
+			continue;
+
+		found = __kho_radix_next_node(phys_to_virt(node->table[i]),
+					      level - 1, start + i * span,
+					      key, pos_level);
+		if (found)
+			return found;
+	}
+
+	return NULL;
+}
+
+/**
+ * kho_radix_next_node - Find the next node in the radix tree.
+ * @tree: The KHO radix tree.
+ * @key: Position to start searching from. Set to the first key covered by the
+ *       node found.
+ * @level: Position to start searching from. Set to the level of the node
+ *         found. Level 0 is the leaf bitmaps.
+ *
+ * Nodes are ordered by the first key they cover, and nodes that cover the same
+ * first key by decreasing level, i.e. a node comes before its children. Finds
+ * the first node of @tree that is at or after the position (*@key, *@level) in
+ * that order. Position (0, %UINT_MAX) finds the root. To move past a node at
+ * (k, l), search from (k, l - 1), or from (k + 1, %UINT_MAX) if l is 0.
+ *
+ * Use kho_radix_for_each_node() instead of calling this directly.
+ *
+ * Return: Pointer to the page holding the node found, or %NULL if there is
+ * none. @key and @level are left alone if there is none.
+ */
+void *kho_radix_next_node(struct kho_radix_tree *tree, unsigned long *key,
+			  unsigned int *level)
+{
+	if (WARN_ON_ONCE(!tree->root))
+		return NULL;
+
+	if (unlikely(fls64(*key) > KHO_RADIX_KEY_WIDTH))
+		return NULL;
+
+	guard(mutex)(&tree->lock);
+
+	return __kho_radix_next_node(tree->root, KHO_TREE_MAX_DEPTH - 1, 0,
+				     key, level);
+}
+EXPORT_SYMBOL_GPL(kho_radix_next_node);
 
 /* For physically contiguous 0-order pages. */
 static void kho_init_pages(struct page *page, unsigned long nr_pages)
@@ -616,7 +677,7 @@ static struct page *__init kho_get_preserved_page(phys_addr_t phys,
 	return pfn_to_page(pfn);
 }
 
-static int __init kho_preserved_memory_reserve(unsigned long key, void *data)
+static void __init kho_preserved_memory_reserve(unsigned long key)
 {
 	union kho_page_info info;
 	struct page *page;
@@ -635,8 +696,6 @@ static int __init kho_preserved_memory_reserve(unsigned long key, void *data)
 	info.magic = KHO_PAGE_MAGIC;
 	info.order = order;
 	page->private = info.page_private;
-
-	return 0;
 }
 
 /* Returns physical address of the preserved memory map from FDT */
@@ -957,20 +1016,11 @@ err_disable_kho:
 #define KHO_DISCOVER_BLKSIZE		SZ_1G
 #define KHO_DISCOVER_BLKSHIFT	const_ilog2(KHO_DISCOVER_BLKSIZE)
 
-/* Called for the KHO preserved memory radix tree. */
-static int __init kho_discover_walk_leaf(unsigned long key, void *data)
+/* Mark the blocks covering the range [start, end) as busy. */
+static int __init kho_discover_mark_busy(struct kho_radix_tree *busy_blocks,
+					 phys_addr_t start, phys_addr_t end)
 {
-	struct kho_radix_tree *busy_blocks = data;
-	phys_addr_t start, end;
-	unsigned int order;
 	int err;
-
-	/*
-	 * The key is from the KHO preserved memory radix tree. It is decoded to
-	 * a physical address of a preservation and its order.
-	 */
-	start = kho_decode_radix_key(key, &order);
-	end = start + (1UL << (order + PAGE_SHIFT));
 
 	while (start < end) {
 		err = kho_radix_add_key(busy_blocks, start >> KHO_DISCOVER_BLKSHIFT);
@@ -983,31 +1033,6 @@ static int __init kho_discover_walk_leaf(unsigned long key, void *data)
 	return 0;
 }
 
-/* Called for the KHO preserved memory radix tree. */
-static int __init kho_discover_walk_node(phys_addr_t phys, void *data)
-{
-	struct kho_radix_tree *busy_blocks = data;
-
-	return kho_radix_add_key(busy_blocks, phys >> KHO_DISCOVER_BLKSHIFT);
-}
-
-/* Called for the busy block radix tree. */
-static int __init kho_discover_mark_noprsrv(unsigned long key, void *data)
-{
-	phys_addr_t *prev_end = data;
-	phys_addr_t start = key << KHO_DISCOVER_BLKSHIFT;
-	int err;
-
-	if (start > *prev_end) {
-		err = memblock_mark_kho_noprsrv(*prev_end, start - *prev_end);
-		if (err)
-			return err;
-	}
-
-	*prev_end = start + (1UL << KHO_DISCOVER_BLKSHIFT);
-	return 0;
-}
-
 /*
  * kho_discover_noprsrv - Discover memory with no preservations
  *
@@ -1016,12 +1041,12 @@ static int __init kho_discover_mark_noprsrv(unsigned long key, void *data)
  *
  * The KHO preserved memory radix tree mixes both physical address and order
  * into a single key. This makes it hard to look for free ranges directly. This
- * function first walks the radix tree and digests it down into another radix
- * tree, whose keys identify blocks of size KHO_DISCOVER_BLKSIZE which contain
- * preserved memory.
+ * function first iterates over the radix tree and digests it down into another
+ * radix tree, whose keys identify blocks of size KHO_DISCOVER_BLKSIZE which
+ * contain preserved memory.
  *
- * Then it walks the digested radix tree and marks everything that doesn't have
- * preserved memory as NOPRSRV.
+ * Then it iterates over the digested radix tree and marks everything that
+ * doesn't have preserved memory as NOPRSRV.
  *
  * NOTE: This function allocates memory so it should be called when bootmem has
  * available space.
@@ -1038,40 +1063,45 @@ static int __init kho_discover_mark_noprsrv(unsigned long key, void *data)
  */
 static void __init kho_discover_noprsrv(void)
 {
-	const struct kho_radix_walk_cb kho_cb = {
-		.leaf = kho_discover_walk_leaf,
-		.node = kho_discover_walk_node,
-	};
-	const struct kho_radix_walk_cb ext_cb = {
-		.leaf = kho_discover_mark_noprsrv,
-	};
-	static struct lock_class_key busy_radix_class;
 	struct kho_radix_tree busy_blocks;
-	phys_addr_t prev_end = 0;
-	int err = 0;
+	phys_addr_t start, prev_end = 0;
+	unsigned int level, order;
+	unsigned long key;
+	void *node;
+	int err;
 
 	err = kho_radix_init_tree(&busy_blocks, NULL);
 	if (err)
 		goto print;
 
-	/*
-	 * The walk of kho_in.radix_tree adds keys to busy_blocks. The walk
-	 * takes the kho_in radix tree lock and adding the key takes busy_blocks
-	 * lock. Since both are struct kho_radix_tree and share the same lock
-	 * class, lockdep gets confused. Set a different class for
-	 * busy_blocks.lock to make lockdep happy.
-	 */
-	lockdep_set_class(&busy_blocks.lock, &busy_radix_class);
+	/* The pages of the KHO radix tree itself are busy. */
+	kho_radix_for_each_node(&kho_in.radix_tree, node, key, level) {
+		start = virt_to_phys(node);
+		err = kho_discover_mark_busy(&busy_blocks, start, start + PAGE_SIZE);
+		if (err)
+			goto out;
+	}
 
-	/* Walk the KHO radix tree to find busy blocks. */
-	err = kho_radix_walk_tree(&kho_in.radix_tree, &kho_cb, &busy_blocks);
-	if (err)
-		goto out;
+	/* So is the preserved memory. */
+	kho_radix_for_each(&kho_in.radix_tree, key) {
+		start = kho_decode_radix_key(key, &order);
+		err = kho_discover_mark_busy(&busy_blocks, start,
+					     start + (1UL << (order + PAGE_SHIFT)));
+		if (err)
+			goto out;
+	}
 
-	/* Walk the busy blocks and mark everything between keys as noprsrv. */
-	err = kho_radix_walk_tree(&busy_blocks, &ext_cb, &prev_end);
-	if (err)
-		goto out;
+	/* Mark everything between busy blocks as noprsrv. */
+	kho_radix_for_each(&busy_blocks, key) {
+		start = key << KHO_DISCOVER_BLKSHIFT;
+		if (start > prev_end) {
+			err = memblock_mark_kho_noprsrv(prev_end, start - prev_end);
+			if (err)
+				goto out;
+		}
+
+		prev_end = start + (1UL << KHO_DISCOVER_BLKSHIFT);
+	}
 
 	/* Mark everything from last busy block to end of DRAM. */
 	if (prev_end < memblock_end_of_DRAM())
@@ -1728,22 +1758,10 @@ EXPORT_SYMBOL_GPL(kho_retrieve_subtree);
 
 static void __init kho_mem_retrieve(void)
 {
-	const struct kho_radix_walk_cb cb = {
-		.leaf = kho_preserved_memory_reserve,
-	};
+	unsigned long key;
 
-	if (kho_radix_walk_tree(&kho_in.radix_tree, &cb, NULL))
-		goto err;
-
-	return;
-
-err:
-	/*
-	 * Failed to initialize preserved memory. Clear FDT and radix so KHO
-	 * users don't treat it as a KHO boot.
-	 */
-	kho_in.fdt_phys = 0;
-	kho_in.radix_tree.root = NULL;
+	kho_radix_for_each(&kho_in.radix_tree, key)
+		kho_preserved_memory_reserve(key);
 }
 
 static __init int kho_out_fdt_setup(void)
