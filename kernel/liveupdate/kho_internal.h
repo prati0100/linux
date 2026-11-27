@@ -11,8 +11,8 @@
 
 struct kho_debugfs {
 	struct dentry *dir;
-	struct dentry *sub_fdt_dir;
-	struct list_head fdt_list;
+	struct dentry *sub_blob_dir;
+	struct list_head blob_list;
 };
 
 #else

@@ -17,7 +17,7 @@
 
 static struct dentry *debugfs_root;
 
-struct fdt_debugfs {
+struct kho_debugfs_blob {
 	struct list_head list;
 	struct debugfs_blob_wrapper wrapper;
 	struct dentry *file;
@@ -27,24 +27,24 @@ static int __kho_debugfs_blob_add(struct list_head *list, struct dentry *dir,
 				  const char *name, const void *blob,
 				  size_t size)
 {
-	struct fdt_debugfs *f;
+	struct kho_debugfs_blob *b;
 	struct dentry *file;
 
-	f = kmalloc_obj(*f);
-	if (!f)
+	b = kmalloc_obj(*b);
+	if (!b)
 		return -ENOMEM;
 
-	f->wrapper.data = (void *)blob;
-	f->wrapper.size = size;
+	b->wrapper.data = (void *)blob;
+	b->wrapper.size = size;
 
-	file = debugfs_create_blob(name, 0400, dir, &f->wrapper);
+	file = debugfs_create_blob(name, 0400, dir, &b->wrapper);
 	if (IS_ERR(file)) {
-		kfree(f);
+		kfree(b);
 		return PTR_ERR(file);
 	}
 
-	f->file = file;
-	list_add(&f->list, list);
+	b->file = file;
+	list_add(&b->list, list);
 
 	return 0;
 }
@@ -57,20 +57,20 @@ int kho_debugfs_blob_add(struct kho_debugfs *dbg, const char *name,
 	if (root)
 		dir = dbg->dir;
 	else
-		dir = dbg->sub_fdt_dir;
+		dir = dbg->sub_blob_dir;
 
-	return __kho_debugfs_blob_add(&dbg->fdt_list, dir, name, blob, size);
+	return __kho_debugfs_blob_add(&dbg->blob_list, dir, name, blob, size);
 }
 
 void kho_debugfs_blob_remove(struct kho_debugfs *dbg, void *blob)
 {
-	struct fdt_debugfs *ff;
+	struct kho_debugfs_blob *b;
 
-	list_for_each_entry(ff, &dbg->fdt_list, list) {
-		if (ff->wrapper.data == blob) {
-			debugfs_remove(ff->file);
-			list_del(&ff->list);
-			kfree(ff);
+	list_for_each_entry(b, &dbg->blob_list, list) {
+		if (b->wrapper.data == blob) {
+			debugfs_remove(b->file);
+			list_del(&b->list);
+			kfree(b);
 			break;
 		}
 	}
@@ -99,7 +99,7 @@ __init void kho_in_debugfs_init(struct kho_debugfs *dbg, const void *fdt)
 	struct dentry *dir;
 	int err;
 
-	INIT_LIST_HEAD(&dbg->fdt_list);
+	INIT_LIST_HEAD(&dbg->blob_list);
 
 	dir = debugfs_create_dir("in", debugfs_root);
 	if (IS_ERR(dir)) {
@@ -107,7 +107,7 @@ __init void kho_in_debugfs_init(struct kho_debugfs *dbg, const void *fdt)
 		goto err_out;
 	}
 
-	err = __kho_debugfs_blob_add(&dbg->fdt_list, dir, "fdt", fdt,
+	err = __kho_debugfs_blob_add(&dbg->blob_list, dir, "fdt", fdt,
 				     fdt_totalsize(fdt));
 	if (err)
 		goto err_rmdir;
@@ -131,16 +131,16 @@ err_out:
 
 __init int kho_out_debugfs_init(struct kho_debugfs *dbg)
 {
-	struct dentry *dir, *f, *sub_fdt_dir;
+	struct dentry *dir, *f, *sub_blob_dir;
 
-	INIT_LIST_HEAD(&dbg->fdt_list);
+	INIT_LIST_HEAD(&dbg->blob_list);
 
 	dir = debugfs_create_dir("out", debugfs_root);
 	if (IS_ERR(dir))
 		return -ENOMEM;
 
-	sub_fdt_dir = debugfs_create_dir("sub_fdts", dir);
-	if (IS_ERR(sub_fdt_dir))
+	sub_blob_dir = debugfs_create_dir("sub_blobs", dir);
+	if (IS_ERR(sub_blob_dir))
 		goto err_rmdir;
 
 	f = debugfs_create_file("bootmem_phys", 0400, dir, NULL,
@@ -154,7 +154,7 @@ __init int kho_out_debugfs_init(struct kho_debugfs *dbg)
 		goto err_rmdir;
 
 	dbg->dir = dir;
-	dbg->sub_fdt_dir = sub_fdt_dir;
+	dbg->sub_blob_dir = sub_blob_dir;
 	return 0;
 
 err_rmdir:
