@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: GPL-2.0
 
 kho-y :=								\
-		kexec_handover.o				\
+		kho_core.o					\
 		kho_block.o
 
-kho-$(CONFIG_KEXEC_HANDOVER_DEBUGFS) += kexec_handover_debugfs.o
+kho-$(CONFIG_KEXEC_HANDOVER_DEBUGFS) += kho_debugfs.o
 
 obj-$(CONFIG_KEXEC_HANDOVER)		+= kho.o
 

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * kexec_handover.c - kexec handover metadata processing
+ * kho_core.c - kexec handover metadata processing
  * Copyright (C) 2023 Alexander Graf <graf@amazon.com>
  * Copyright (C) 2025 Microsoft Corporation, Mike Rapoport <rppt@kernel.org>
  * Copyright (C) 2025 Google LLC, Changyuan Lyu <changyuanl@google.com>
@@ -39,7 +39,7 @@
 #include "../../mm/mm_init.h"
 #include "../../mm/vmalloc.h"
 #include "../kexec_internal.h"
-#include "kexec_handover_internal.h"
+#include "kho_internal.h"
 
 /*
  * This is the minimal alignment required by deferred struct page init.

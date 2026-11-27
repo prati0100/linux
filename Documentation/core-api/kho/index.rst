@@ -89,7 +89,7 @@ Kexec Handover Radix Tree
 Public API
 ==========
 
-.. kernel-doc:: kernel/liveupdate/kexec_handover.c
+.. kernel-doc:: kernel/liveupdate/kho_core.c
   :export:
 
 KHO Serialization Blocks API

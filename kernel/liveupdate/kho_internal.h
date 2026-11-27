@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-#ifndef LINUX_KEXEC_HANDOVER_INTERNAL_H
-#define LINUX_KEXEC_HANDOVER_INTERNAL_H
+#ifndef LINUX_KHO_INTERNAL_H
+#define LINUX_KHO_INTERNAL_H
 
 #include <linux/kexec_handover.h>
 #include <linux/list.h>
@@ -41,4 +41,4 @@ static inline void kho_debugfs_blob_remove(struct kho_debugfs *dbg,
 					   void *blob) { }
 #endif /* CONFIG_KEXEC_HANDOVER_DEBUGFS */
 
-#endif /* LINUX_KEXEC_HANDOVER_INTERNAL_H */
+#endif /* LINUX_KHO_INTERNAL_H */
